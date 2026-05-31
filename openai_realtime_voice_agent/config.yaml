@@ -1,5 +1,5 @@
 name: OpenAI Realtime Voice Agent
-version: "0.1.0"
+version: "0.2.1"
 slug: openai_realtime_voice_agent
 description: Voice control using OpenAI Realtime API with WebSocket support for ESP32 devices
 url: https://github.com/brettfire/ha-openai-realtime
@@ -66,4 +66,3 @@ schema:
   instructions: str
   session_reuse_timeout_seconds: int(0,3600)  # bis 1 Stunde
   enable_recording: bool
-image: ghcr.io/fjfricke/ha-openai-realtime/openai-realtime-voice-agent-{arch}

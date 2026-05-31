@@ -7,11 +7,15 @@ packages = [{include = "app", from = "."}]
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"
-pipecat-ai = {extras = ["mcp", "openai", "websocket"], version = ">=0.0.96"}
+pipecat-ai = {extras = ["mcp", "openai", "websocket"], version = "==0.0.97"}
 python-dotenv = ">=1.0.0"
 fastapi = ">=0.100.0"
 uvicorn = {extras = ["standard"], version = ">=0.23.0"}
 websockets = ">=13.0"
+# Pin llvmlite to the version the Dockerfile's LLVM 15 install supports.
+# Without this poetry resolves to llvmlite 0.47.0 which needs LLVM 18+
+# and the local Docker build fails on aarch64 / amd64 alike.
+llvmlite = "==0.44.0"
 
 [tool.poetry.scripts]
 start = "app.main:main"
