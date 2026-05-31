@@ -13,7 +13,7 @@ from pipecat.transports.websocket.server import WebsocketServerTransport
 from app.mcp_service import HomeAssistantMCPService
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.audio_recording_service import AudioRecordingService
-from app.session_manager import SessionManager
+from app.session_manager import SessionManager, _shutdown_service_safely
 from app.websocket_handler import WebSocketHandler
 
 # Configure logging
@@ -158,11 +158,24 @@ class Application:
             else:
                 logger.info("🆕 Creating new OpenAI Session...")
             
+            # Capture the previous service so we can schedule its shutdown
+            # in ALL cases below — `cleanup_before_new_session` only handles
+            # services tracked in session_manager.current_services (services
+            # created with a client_id). The "initial" service created by
+            # run() before any client connects has no client_id, isn't in
+            # that dict, and would otherwise leak its OpenAI WebSocket
+            # until OpenAI's 60-min session-expiry timer kills it.
+            previous_service = self.openai_service
+
             # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
+            if client_id and previous_service is not None:
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
                     logger.debug(f"Cached context from previous session for client {client_id}")
+                    # cleanup_before_new_session already scheduled shutdown
+                    # for the tracked service; clear local handle so we don't
+                    # double-shutdown below.
+                    previous_service = None
                 except Exception as e:
                     logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
             
@@ -263,7 +276,15 @@ class Application:
             )
             
             logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
-            
+
+            # If we still have a previous service that session_manager didn't
+            # handle (the initial run()-created one, or any anonymous path),
+            # schedule its shutdown so its OpenAI WebSocket gets closed
+            # instead of idling until OpenAI's 60-min session-expiry.
+            if previous_service is not None:
+                logger.info("🧹 Shutting down untracked previous OpenAI service")
+                asyncio.create_task(_shutdown_service_safely(previous_service))
+
             # Create new service instance
             self.openai_service = OpenAIRealtimeLLMService(
                 api_key=self.openai_api_key,
