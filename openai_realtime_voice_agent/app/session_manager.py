@@ -1,4 +1,5 @@
 """Session management with context caching for OpenAI Realtime API."""
+import asyncio
 import logging
 import time
 from typing import Optional, Dict
@@ -9,6 +10,31 @@ from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, StartFrame, LLMMessagesUpdateFrame
 
 logger = logging.getLogger(__name__)
+
+
+async def _shutdown_service_safely(service: OpenAIRealtimeLLMService) -> None:
+    """Close the OpenAI WebSocket and cancel background tasks for a service.
+
+    Called fire-and-forget when an OpenAI service is being replaced (new
+    session) or when its client has disconnected. Without this, the
+    underlying WebSocket to OpenAI's Realtime API stays open, holding
+    references that prevent GC, and OpenAI's 60-minute session limit
+    eventually triggers a `1001 (going away)` that pipecat's pending
+    audio queue then amplifies into thousands of ErrorFrames.
+
+    Both pipecat-level cleanup (`cleanup()` — cancels input/process
+    tasks + metrics) and the OpenAI-WS-specific `_disconnect()` are
+    needed; `cleanup()` alone leaves the socket open.
+    """
+    try:
+        await service._disconnect()
+    except Exception as e:
+        logger.debug(f"old service _disconnect() raised: {e}")
+    try:
+        await service.cleanup()
+    except Exception as e:
+        logger.debug(f"old service cleanup() raised: {e}")
+    logger.info("🧹 Shut down old OpenAI service (WS closed, tasks cancelled)")
 
 
 class ContextCacheEntry:
@@ -179,18 +205,27 @@ class SessionManager:
     
     def cleanup_before_new_session(self, client_id: str):
         """Cleanup before creating a new session for a client.
-        
+
         This should be called before creating a new session to cache
-        the context from the current service.
-        
+        the context from the current service, and to schedule a clean
+        shutdown of the old service (closing its OpenAI WS + cancelling
+        its async tasks). Without that shutdown the orphaned service
+        keeps its WS open until OpenAI's 60-minute timeout fires,
+        producing a giant ErrorFrame avalanche.
+
         Args:
             client_id: Unique identifier for the client device
         """
         # Cache context from service/aggregator
         if client_id in self.current_services:
-            self.cache_context_from_service(client_id, self.current_services[client_id])
+            old_service = self.current_services[client_id]
+            self.cache_context_from_service(client_id, old_service)
             del self.current_services[client_id]
-        
+            # Fire-and-forget so we don't block the new session on
+            # the OpenAI WS close handshake. Runs on the same event
+            # loop as the caller (which is async).
+            asyncio.create_task(_shutdown_service_safely(old_service))
+
         # Remove context aggregator (will be recreated for new session)
         self.remove_context_aggregator(client_id)
     
@@ -251,6 +286,21 @@ class SessionManager:
                 logger.info(f"💾 Cached context for disconnected client {client_id}")
             except Exception as e:
                 logger.warning(f"⚠️ Error caching context for disconnected client {client_id}: {e}")
+
+            # Schedule clean shutdown of the OpenAI service so its WS
+            # is closed promptly. If we leave it open, OpenAI's 60-min
+            # session timeout eventually fires 1001 and pipecat's
+            # pending audio queue amplifies it into thousands of
+            # ErrorFrames (the spam you'd see in the log).
+            try:
+                asyncio.create_task(_shutdown_service_safely(service_to_cache))
+            except RuntimeError as e:
+                # No running event loop — shouldn't happen in normal
+                # disconnect handling but don't crash either way.
+                logger.warning(
+                    f"⚠️ Could not schedule shutdown of OpenAI service for "
+                    f"client {client_id}: {e}"
+                )
         else:
             logger.debug(f"No service found to cache context for client {client_id}")
 
