@@ -187,7 +187,7 @@ class Application:
                 try:
                     logger.info("🔧 Fetching MCP tool definitions...")
                     mcp_tools_schema = await self.mcp_client.get_tools_schema()
-                    
+
                     # Convert MCP tool schemas to OpenAI format
                     for function_schema in mcp_tools_schema.standard_tools:
                         openai_tool = {
@@ -201,13 +201,34 @@ class Application:
                             }
                         }
                         all_tools.append(openai_tool)
-                    
+
                     logger.info(f"✅ Fetched {len(mcp_tools_schema.standard_tools)} MCP tools")
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
-            
+
+            # Fetch HA's Assist system prompt (entity list, areas, current
+            # states) and append to our base instructions. This is what
+            # makes regular Assist aware of the user's home — without it,
+            # the OpenAI model has tools but no nouns. Best-effort: if
+            # the MCP server doesn't expose a prompt, fall back to base.
+            session_instructions = self.instructions
+            if self.mcp_service:
+                try:
+                    assist_prompt = await self.mcp_service.fetch_assist_prompt()
+                    if assist_prompt:
+                        session_instructions = (
+                            f"{self.instructions}\n\n"
+                            f"# Home Assistant context (from MCP server)\n"
+                            f"{assist_prompt}"
+                        )
+                        logger.info(
+                            f"✅ Loaded HA Assist prompt ({len(assist_prompt)} chars)"
+                        )
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to fetch HA Assist prompt: {e}")
+
             session_properties = SessionProperties(
-                instructions=self.instructions,
+                instructions=session_instructions,
                 audio=AudioConfiguration(
                     input=AudioInput(
                         turn_detection=TurnDetection(
