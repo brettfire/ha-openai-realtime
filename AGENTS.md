@@ -3,6 +3,23 @@
 Operational notes for AI agents (Claude Code etc.) working in this repo.
 Humans should read [README.md](README.md) first.
 
+## Quick reference: justfile
+
+Most dev-loop commands are recipes in `/justfile`. Run `just` (no args)
+to list them. Highlights:
+
+| Recipe | What it does |
+|---|---|
+| `just flash` | Compile + OTA-flash the Voice PE + stream logs (the daily firmware loop). |
+| `just compile` / `just validate` | Just compile / just validate the YAML. |
+| `just logs` | Tail logs from a running device. |
+| `just flash-usb port=/dev/...` | USB serial flash. |
+| `just diff-upstream` | Diff our `voice_pe_config.yaml` against the upstream HA Voice PE YAML at the pinned tag. Override with `just upstream_ref=main diff-upstream` to see drift from latest. |
+| `just addon-build` / `just addon-smoke` | Local Docker build + smoke-test of the addon image (matches the HAOS aarch64 image). |
+| `just addon-verify-published` | Pull and sanity-check what HAOS would install. |
+
+Prefer the justfile over hand-typing `cd home-assistant-voice-pe && poetry run esphome ...` — the recipes encapsulate the right working directories, build args, and docker invocations.
+
 ## Repo layout
 
 Two coupled components ship from this repo. Both must be in sync for

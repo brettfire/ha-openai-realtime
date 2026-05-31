@@ -1,0 +1,95 @@
+# justfile — common dev commands for ha-openai-realtime
+#
+# Run `just` (no args) to see the list. Requires `just`:
+#   brew install just
+# All paths are repo-relative.
+
+# Show all recipes.
+default:
+    @just --list
+
+# ---------------------------------------------------------------------------
+# Variables (override on the command line: `just upstream_ref=main diff-upstream`)
+# ---------------------------------------------------------------------------
+
+# Upstream HA Voice PE repo we diff against.
+upstream_repo := "esphome/home-assistant-voice-pe"
+upstream_file := "home-assistant-voice.yaml"
+# Tag we currently pin in external_components. Use "main" for latest upstream.
+upstream_ref := "25.11.0"
+
+# Path to Docker CLI on macOS Docker Desktop (not in default PATH).
+docker := "/Applications/Docker.app/Contents/Resources/bin/docker"
+
+# Serial port for USB flashing. Override per recipe call.
+port := "/dev/cu.usbmodem*"
+
+# ---------------------------------------------------------------------------
+# ESPHome firmware (Voice PE satellite)
+# ---------------------------------------------------------------------------
+
+# Validate voice_pe_config.yaml without compiling.
+validate:
+    cd home-assistant-voice-pe && poetry run esphome config voice_pe_config.yaml
+
+# Compile the firmware (no flash, no logs).
+compile:
+    cd home-assistant-voice-pe && poetry run esphome compile voice_pe_config.yaml
+
+# Compile, OTA-flash the device, and stream logs (default dev loop).
+flash:
+    cd home-assistant-voice-pe && poetry run esphome run voice_pe_config.yaml
+
+# USB-flash via serial. Override port: `just port=/dev/cu.usbserial-1234 flash-usb`.
+flash-usb:
+    cd home-assistant-voice-pe && poetry run esphome run --device {{port}} voice_pe_config.yaml
+
+# Stream logs from the already-running device.
+logs:
+    cd home-assistant-voice-pe && poetry run esphome logs voice_pe_config.yaml
+
+# Wipe esphome build cache (forces a fresh compile).
+clean:
+    cd home-assistant-voice-pe && poetry run esphome clean voice_pe_config.yaml
+
+# Default ref is the version we pin in external_components; override with
+# `just upstream_ref=main diff-upstream` to compare against the latest.
+# Diff our voice_pe_config.yaml against upstream HA Voice PE YAML.
+diff-upstream:
+    @echo "Diffing voice_pe_config.yaml vs {{upstream_repo}}@{{upstream_ref}}/{{upstream_file}}"
+    @echo
+    @curl -fsSL "https://raw.githubusercontent.com/{{upstream_repo}}/{{upstream_ref}}/{{upstream_file}}" \
+        | git diff --no-index --color=always -- - home-assistant-voice-pe/voice_pe_config.yaml \
+        || true
+
+# ---------------------------------------------------------------------------
+# Addon (server side)
+# ---------------------------------------------------------------------------
+
+# Tags as `local-test:dev`. Native ~75s on Apple Silicon, cached few seconds.
+# Local docker build of the aarch64 addon image (matches HAOS).
+addon-build:
+    cd openai_realtime_voice_agent && \
+        {{docker}} buildx build \
+            --platform linux/arm64 \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest \
+            --build-arg BUILD_ARCH=aarch64 \
+            -t local-test:dev .
+
+# Smoke-test the locally built image: import core modules.
+addon-smoke:
+    {{docker}} run --platform linux/arm64 --rm \
+        --entrypoint /usr/bin/python3 local-test:dev -c \
+        'from app.main import Application; from app.mcp_service import HomeAssistantMCPService; \
+         svc = HomeAssistantMCPService("x", ""); \
+         print("imports OK; has fetch_assist_prompt_and_snapshot:", \
+               hasattr(svc, "fetch_assist_prompt_and_snapshot"))'
+
+# Pull + verify the latest published addon image from ghcr.io.
+addon-verify-published:
+    {{docker}} pull --platform linux/arm64 \
+        ghcr.io/brettfire/ha-openai-realtime/openai-realtime-voice-agent-aarch64:latest
+    {{docker}} run --platform linux/arm64 --rm \
+        --entrypoint /usr/bin/python3 \
+        ghcr.io/brettfire/ha-openai-realtime/openai-realtime-voice-agent-aarch64:latest -c \
+        'from app.mcp_service import HomeAssistantMCPService; print("published image OK")'
