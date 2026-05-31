@@ -2,6 +2,17 @@
 
 Home Assistant addon that provides OpenAI Realtime API integration with WebSocket support for ESP32 devices.
 
+## Requirements
+
+- Home Assistant Core 2026.5+ recommended. The addon works on 2026.4.x
+  but cannot fetch the live entity-state snapshot resource
+  (`homeassistant://assist/context-snapshot`, added to HA's
+  `mcp_server` in PR #167396 on 2026-04-07 — after the 2026.4.x branch
+  froze). On 2026.4.x the snapshot fetch is silently skipped; the
+  Assist system prompt (entity catalog, areas) is still injected.
+- Enable HA's **Model Context Protocol Server** integration
+  (Settings → Devices & Services → Add Integration).
+
 ## Installation
 
 ### Option 1: Add Repository (Recommended)

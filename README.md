@@ -48,12 +48,21 @@ This repository contains two main components:
 1. **Install the Server Addon**: Follow the [server documentation](openai_realtime_voice_agent/README.md)
 2. **Configure ESP32 Device**: Follow the [client documentation](home-assistant-voice-pe/README.md)
 
-## Known Issues
+## Prerequisites
 
-The endpoint `http://supervisor/core/api/mcp` is not working. You need to:
-- Create a long-lived token in Home Assistant
-- Use it in the addon configuration
-- Set the Home Assistant MCP URL to `http://localhost:8123/api/mcp` (or your Home Assistant URL). The MCP Server needs to be enabled in Home Assistant.
+- **Home Assistant Core 2026.5+ recommended.** The addon uses HA's
+  built-in `mcp_server` integration via the supervisor proxy at
+  `http://supervisor/core/api/mcp`. With 2026.5+ the addon can also
+  pull the live-context snapshot resource
+  (`homeassistant://assist/context-snapshot`, added in PR #167396)
+  for richer per-turn entity-state context. On older 2026.x the
+  snapshot fetch is silently skipped; everything else still works.
+- Enable the **Model Context Protocol Server** integration in HA
+  (Settings → Devices & Services → Add Integration).
+- Expose the entities you want the voice agent to control via
+  Settings → Voice assistants → Expose. Fewer, well-targeted
+  exposures produce noticeably better recognition than dumping
+  hundreds of low-signal entities.
 
 ## License
 

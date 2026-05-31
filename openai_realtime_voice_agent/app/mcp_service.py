@@ -118,51 +118,66 @@ class HomeAssistantMCPService:
             _,
         ):
             async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
+                init_result = await session.initialize()
+                caps = getattr(init_result, "capabilities", None)
+                prompts_supported = (
+                    caps is not None and getattr(caps, "prompts", None) is not None
+                )
+                resources_supported = (
+                    caps is not None and getattr(caps, "resources", None) is not None
+                )
 
-                # Default prompt (entity catalog, etc.). Best-effort; a
-                # failure here shouldn't suppress the snapshot fetch.
-                try:
-                    prompts_result = await session.list_prompts()
-                    if prompts_result.prompts:
-                        prompt_result = await session.get_prompt(
-                            prompts_result.prompts[0].name
+                # Default prompt (entity catalog, etc.). HA 2026.x advertises
+                # prompts capability; older / non-HA servers may not. Best-
+                # effort; a failure here shouldn't suppress the snapshot.
+                if prompts_supported:
+                    try:
+                        prompts_result = await session.list_prompts()
+                        if prompts_result.prompts:
+                            prompt_result = await session.get_prompt(
+                                prompts_result.prompts[0].name
+                            )
+                            if prompt_result.messages:
+                                prompt_text = getattr(
+                                    prompt_result.messages[0].content,
+                                    "text",
+                                    None,
+                                )
+                    except BaseException as e:  # noqa: BLE001 — unwrap below
+                        _log_unwrapped("fetch Assist prompt", e)
+
+                # Live-context snapshot. Added to HA's mcp_server in
+                # 2026.5 (PR #167396, merged 2026-04-07 — after the
+                # 2026.4.x branch froze). On 2026.4.x the resources
+                # capability isn't advertised, so the gate below quietly
+                # skips the call instead of triggering a "Method not
+                # found" warning. Pass the AnyUrl from list_resources
+                # straight back to read_resource; the HA server compares
+                # `str(uri) != SNAPSHOT_RESOURCE_URI` and pydantic-
+                # normalized strings may not match the literal.
+                if resources_supported:
+                    try:
+                        resources_result = await session.list_resources()
+                        matching = next(
+                            (
+                                r
+                                for r in resources_result.resources
+                                if str(r.uri) == snapshot_uri
+                            ),
+                            None,
                         )
-                        if prompt_result.messages:
-                            prompt_text = getattr(
-                                prompt_result.messages[0].content,
-                                "text",
-                                None,
-                            )
-                except BaseException as e:  # noqa: BLE001 — unwrap below
-                    _log_unwrapped(
-                        "fetch Assist prompt", e
-                    )
-
-                # Live-context snapshot (current entity states). Pass the
-                # AnyUrl object returned by list_resources verbatim so the
-                # HA server's `str(uri) == SNAPSHOT_RESOURCE_URI` check
-                # passes — pydantic may normalize a raw string and break
-                # equality.
-                try:
-                    resources_result = await session.list_resources()
-                    matching = next(
-                        (
-                            r
-                            for r in resources_result.resources
-                            if str(r.uri) == snapshot_uri
-                        ),
-                        None,
-                    )
-                    if matching is not None:
-                        read_result = await session.read_resource(matching.uri)
-                        if read_result.contents:
-                            snapshot_text = getattr(
-                                read_result.contents[0], "text", None
-                            )
-                except BaseException as e:  # noqa: BLE001 — unwrap below
-                    _log_unwrapped(
-                        "fetch live-context snapshot", e
+                        if matching is not None:
+                            read_result = await session.read_resource(matching.uri)
+                            if read_result.contents:
+                                snapshot_text = getattr(
+                                    read_result.contents[0], "text", None
+                                )
+                    except BaseException as e:  # noqa: BLE001 — unwrap below
+                        _log_unwrapped("fetch live-context snapshot", e)
+                else:
+                    logger.debug(
+                        "MCP server does not advertise resources capability "
+                        "— skipping live-context snapshot (HA <2026.5)"
                     )
 
         return (prompt_text, snapshot_text)
