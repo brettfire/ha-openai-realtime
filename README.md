@@ -48,12 +48,16 @@ This repository contains two main components:
 1. **Install the Server Addon**: Follow the [server documentation](openai_realtime_voice_agent/README.md)
 2. **Configure ESP32 Device**: Follow the [client documentation](home-assistant-voice-pe/README.md)
 
-## Known Issues
+## Prerequisites
 
-The endpoint `http://supervisor/core/api/mcp` is not working. You need to:
-- Create a long-lived token in Home Assistant
-- Use it in the addon configuration
-- Set the Home Assistant MCP URL to `http://localhost:8123/api/mcp` (or your Home Assistant URL). The MCP Server needs to be enabled in Home Assistant.
+Home Assistant's built-in **Model Context Protocol Server** integration must be
+enabled (Settings → Devices & Services → Add Integration → "Model Context
+Protocol Server"). With it enabled, the addon talks to it through the supervisor
+proxy at `http://supervisor/core/api/mcp` using the `homeassistant_api`
+permission and `SUPERVISOR_TOKEN` — no long-lived token required.
+
+To point at an external Home Assistant instead (e.g. via Nabu Casa), set
+`ha_mcp_url` and `longlived_token` in the addon configuration.
 
 ## License
 

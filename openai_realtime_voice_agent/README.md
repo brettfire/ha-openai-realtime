@@ -22,13 +22,23 @@ Home Assistant addon that provides OpenAI Realtime API integration with WebSocke
 Configure the addon in Home Assistant:
 
 1. Go to **Supervisor** → **Add-on Store** → **OpenAI Realtime Voice Agent** → **Configuration**
-2. Set the following required options:
+2. Set the following required option:
    - `openai_api_key`: Your OpenAI API key
-   - `websocket_port`: Port for WebSocket connections (default: 8080)
-   - `ha_mcp_url`: Home Assistant MCP URL (e.g., `http://localhost:8123/api/mcp`)
-   - `longlived_token`: Home Assistant long-lived access token
 
-3. Optional settings:
+3. MCP connection (defaults work out of the box on HAOS):
+   - `ha_mcp_url`: defaults to `http://supervisor/core/api/mcp`. The addon's
+     `homeassistant_api: true` permission grants access to this supervisor
+     proxy route and the `SUPERVISOR_TOKEN` env var is used automatically
+     as the bearer token (see [HA addon docs][ha-addon-comm]). Leave
+     `longlived_token` blank.
+   - To talk to an external Home Assistant instead, set `ha_mcp_url` to that
+     URL (e.g. your Nabu Casa hostname) and provide a `longlived_token`.
+   - Home Assistant's built-in **Model Context Protocol Server** integration
+     must be enabled (Settings → Devices & Services → Add Integration).
+
+[ha-addon-comm]: https://developers.home-assistant.io/docs/add-ons/communication
+
+4. Optional settings:
    - `vad_threshold`: Voice activity detection threshold (0.0-1.0, default: 0.5)
    - `vad_prefix_padding_ms`: Audio padding before detection in milliseconds (default: 300)
    - `vad_silence_duration_ms`: Duration of silence before stopping in milliseconds (default: 500)
@@ -49,6 +59,15 @@ Configure the addon in Home Assistant:
 
 ## Troubleshooting
 
-- **MCP connection issues**: Ensure you're using a long-lived token and the correct MCP URL (`http://homeassistant.local:8123/api/mcp`)
+- **MCP connection issues**:
+  - Confirm the **Model Context Protocol Server** integration is enabled in HA.
+  - With the default `ha_mcp_url` (`http://supervisor/core/api/mcp`), leave
+    `longlived_token` blank — the supervisor proxy rejects user-issued bearer
+    tokens; it requires the auto-provided `SUPERVISOR_TOKEN` instead. If you
+    set a long-lived token here it overrides `SUPERVISOR_TOKEN` and the request
+    returns 401.
+  - To use a long-lived token, point `ha_mcp_url` at a Home Assistant URL that
+    doesn't go through the supervisor (e.g. `http://homeassistant.local:8123/api/mcp`
+    or a Nabu Casa hostname).
 - **WebSocket connection**: Check that the port is accessible and not blocked by firewall
 - **Check logs**: View addon logs in Home Assistant Supervisor
