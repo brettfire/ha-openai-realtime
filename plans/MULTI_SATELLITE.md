@@ -80,71 +80,126 @@ fire `voice_assistant_websocket.start` and open WebSockets to the
 addon. Without arbitration we'd start two concurrent OpenAI sessions
 and the bot would respond on both speakers simultaneously — terrible.
 
-### How HA's native voice solution handles it
+### How HA's native voice solution handles it (verified)
 
-HA Voice / Assist has at least some support for this (need to
-verify — open question):
+HA's `assist_pipeline` integration has a **`DuplicateWakeUpDetectedError`**
+specifically for this case. The algorithm is simpler than I expected:
 
-- Wyoming satellites can report **wake-word audio level** as part
-  of the wake-word event.
-- HA's pipeline coordinator can in principle use that to pick the
-  closest satellite and tell the others to ignore. ESPHome's
-  built-in voice_assistant component has hooks for this.
-- The official HA Voice PE config sets up some of this plumbing
-  but the exact arbitration logic / time window isn't documented
-  prominently.
-- Our custom firmware bypasses HA's voice pipeline entirely (we
-  go straight to a WebSocket to our addon), so whatever HA does
-  natively doesn't apply to us.
+- Global `hass.data[DATA_LAST_WAKE_UP]: dict[str, float]` keyed by
+  **wake-word phrase** (the literal string, e.g. `"okay_nabu"`).
+- On a wake-word detection, the pipeline checks
+  `last_wake_up[phrase]`. If a previous detection of the same
+  phrase happened within `WAKE_WORD_COOLDOWN = 2` seconds,
+  `DuplicateWakeUpDetectedError` is raised — the second pipeline
+  bails and the satellite gets the error code.
+- Otherwise the timestamp is recorded and the pipeline proceeds.
 
-### What we need to build
+So it's **first-come, first-served with a 2-second per-phrase
+cooldown**. Not audio-level voting, not "closest wins" — just
+"first satellite to send the event wins, and any other satellite
+sending the same wake-word phrase within 2s gets rejected."
 
-A small arbiter in the addon, sitting in front of pipeline creation:
+ESPHome's built-in `voice_assistant` component handles the rejection
+on the satellite side: it treats `wake_word_detection_aborted`,
+`wake-word-timeout`, and `no_wake_word` as a benign "false trigger"
+and returns the satellite to idle. So the losing satellite's LED
+flashes briefly and stops.
 
-1. **Satellite reports wake-word event** before opening the
-   conversation pipeline. New JSON control frame:
+References (HA Core, master branch):
+- `homeassistant/components/assist_pipeline/error.py` —
+  `DuplicateWakeUpDetectedError(WakeWordDetectionError)`
+- `homeassistant/components/assist_pipeline/pipeline.py` —
+  the `last_wake_up = self.hass.data[DATA_LAST_WAKE_UP].get(...)`
+  block raises the error
+- `homeassistant/components/assist_pipeline/const.py` —
+  `WAKE_WORD_COOLDOWN = 2` (seconds)
+- `esphome/components/voice_assistant/voice_assistant.cpp` —
+  the satellite-side handler:
+  `if (code == "wake-word-timeout" || code == "wake_word_detection_aborted" || code == "no_wake_word")`
+
+### Why it works well enough
+
+In practice "first to detect" correlates strongly with "closest to
+user" because:
+- Closer satellite hears louder audio → wake-word detector trips
+  with less hysteresis → faster confidence threshold cross.
+- Network latency from satellite to HA is roughly equal across the
+  LAN, so the detection-time ordering survives the trip.
+
+It can degenerate when two satellites are equidistant and one
+happens to detect a frame earlier than the other — but that's a
+coin flip that most users won't notice. The 2-second cooldown is
+long enough that a true second wake word (user trying again because
+the first time didn't work) doesn't get blocked.
+
+### What we'd build
+
+Same algorithm, scoped to our addon. The state is simpler than HA's
+because we have one phrase per device today (no multi-pipeline
+routing concerns).
+
+```python
+# in app/wake_word_arbiter.py (new)
+class WakeWordArbiter:
+    """First-come, first-served arbiter with a per-phrase cooldown.
+
+    Mirrors home-assistant/assist_pipeline's
+    DuplicateWakeUpDetectedError behavior (2-second cooldown).
+    """
+    COOLDOWN_SECONDS = 2.0
+
+    def __init__(self):
+        # phrase -> monotonic timestamp of last winning detection
+        self._last_wake_up: dict[str, float] = {}
+
+    def claim(self, phrase: str) -> bool:
+        """True if this detection wins; False if it's a duplicate."""
+        now = time.monotonic()
+        last = self._last_wake_up.get(phrase)
+        if last is not None and (now - last) < self.COOLDOWN_SECONDS:
+            return False
+        self._last_wake_up[phrase] = now
+        return True
+```
+
+Wire-up:
+
+1. Firmware sends a tiny pre-pipeline frame on wake word:
    ```json
-   {"type":"wake_word_detected","level":-12,"ts":1234567890}
+   {"type":"wake_word_detected","phrase":"okay_nabu"}
    ```
-   `level` is the wake-word detector's confidence or peak audio
-   level in dBFS. `ts` is the satellite's local millis at
-   detection (for ordering ties).
-2. **Arbiter collects events for a short window** (~250ms — long
-   enough that satellites in earshot of the same speech all
-   report, short enough to feel snappy). Keyed by something
-   identifying the conversation, probably just "any wake-word
-   event in the last 250ms" since multiple people talking
-   simultaneously to different satellites is rare.
-3. **Pick the winner** — highest `level`, tiebreak by earliest
-   `ts`.
-4. **Winner gets `{"type":"proceed"}`** — opens the audio stream
-   for OpenAI as usual.
-5. **Losers get `{"type":"yield"}`** — cancel locally, return to
-   idle (their LEDs stop pulsing, no playback). The wake-word
-   detector keeps running so they can win the next turn.
+   `phrase` is the wake-word name from micro_wake_word's model.
+2. Addon's `RawAudioSerializer` (or a parallel handler) calls
+   `arbiter.claim(phrase)`.
+3. If `claim` returns True → addon emits `{"type":"proceed"}`
+   back, and the per-client pipeline gets built / audio streams.
+4. If False → addon emits `{"type":"yield"}` back, and the
+   per-client pipeline never gets created. No OpenAI session
+   opened.
+5. Satellite on `yield`: stop listening, return to idle, brief LED
+   flash. Wake-word detector keeps running for next turn.
 
-### Open question: do we need explicit arbitration?
+Per-phrase keying means if you ever set up two satellites with
+different wake words ("Hey Jarvis" in office, "Okay Nabu"
+elsewhere), they don't conflict — both can fire concurrently for
+different conversations.
 
-Maybe not, if we use OpenAI's own server-side VAD as the arbiter:
-- Both satellites open WS + OpenAI session
-- Both start streaming mic
-- Only one will produce coherent speech (the closest one); the
-  other gets fragmented / quiet audio
-- OpenAI VAD only fires "user started speaking" on the coherent
-  stream — the other session gets nothing useful
-- Bot responds via the satellite that got the actual speech
+### Why we'd skip the audio-level approach
 
-This would cost N × audio-input tokens for N satellites that
-heard the wake word, but avoid the engineering of an arbiter.
-Worth measuring once we have multi-client support — if the
-per-second token cost during the listening window is trivial,
-laziness might win.
+My original plan (level voting) is more code, more state, and
+likely no real-world quality improvement over the timestamp method
+HA uses. Drop it.
 
-The downside: even with VAD silence on the losing satellites,
-**the bot would still respond on all of them** unless we
-separately arbitrate the response. So we probably need at least
-"winner of the speech goes to one satellite" logic. Which is
-basically arbitration anyway.
+### Open question: cooldown value
+
+HA uses 2 seconds. We might want to tune for our usage pattern:
+- Too short (<1s): the slower satellite occasionally wins because
+  some network/scheduling jitter beat the faster one
+- Too long (>3s): a user retrying after a missed wake word gets
+  blocked, frustrating
+
+2 seconds is probably fine — keep HA's value unless we observe
+issues.
 
 ## Phasing
 
@@ -177,8 +232,13 @@ A "ship intermediate value" sequence rather than one big PR:
 | Per-client context caching wired through `session_manager` | ~20 | Low (already keyed by client_id) |
 | End-to-end test with 2+ satellites | — | Need 2 reflashed devices |
 
-Phase 2 arbiter: another ~150 LOC + a small firmware change to
-emit `wake_word_detected` JSON before opening the conversation.
+Phase 2 arbiter (revised after HA research): ~40 LOC of Python
+(the `WakeWordArbiter` class above + a serializer hook) + ~30 LOC
+of C++ on the satellite (emit the `wake_word_detected` JSON before
+opening the conversation, handle `yield` by stopping locally). Much
+smaller than originally estimated because we copy HA's
+2-second-cooldown algorithm instead of inventing a level-voting
+scheme.
 
 Total to fully multi-satellite: probably a focused weekend.
 
@@ -191,13 +251,13 @@ Total to fully multi-satellite: probably a focused weekend.
   Some users want "in the bedroom, default volume is lower" type
   behavior. Could pass a `room` field in the wake-word event and
   template instructions per-room.
-- [ ] **Wake-word arbiter implementation**: own logic vs. delegate
-  to HA's existing satellite coordinator (if usable from outside
-  HA's native voice pipeline).
-- [ ] **Failure mode for arbiter timeout**: if the arbiter window
-  expires with no clear winner (close levels, tie ts), do we let
-  both proceed or pick arbitrarily? Probably "earliest wins" with
-  a warning log.
+- [x] **Wake-word arbiter implementation**: ~~own logic vs.
+  delegate to HA's existing satellite coordinator~~ Resolved:
+  reimplement HA's algorithm (`WakeWordArbiter` above) — copying
+  is cheaper than wiring into HA's pipeline since we already
+  bypass that pipeline.
+- [x] ~~**Failure mode for arbiter timeout**~~ N/A — we don't have
+  a window; HA's algorithm is stateless per-event.
 
 ## Non-goals (for now)
 
