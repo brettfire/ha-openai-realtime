@@ -22,10 +22,11 @@ upstream_ref := "25.11.0"
 docker := "/Applications/Docker.app/Contents/Resources/bin/docker"
 
 # Per-device YAML selector. Default `config` flashes the base
-# voice_pe_config.yaml (which targets the original ha-voice-openai
-# speaker). For an additional speaker, create a tiny per-device
-# wrapper named `voice_pe_<name>.yaml` (template:
-# voice_pe_example.yaml) and call:
+# voice_pe_config.yaml, which produces hostname `voice-<MAC suffix>`
+# (matching stock HA Voice PE naming, so this firmware can OTA-replace
+# a factory-fresh Voice PE without a USB step). For an additional
+# speaker, create a tiny per-device wrapper named
+# `voice_pe_<name>.yaml` (template: voice_pe_example.yaml) and call:
 #   just flash device=<name>
 # Recipes that touch the firmware all honor this variable.
 device := "config"

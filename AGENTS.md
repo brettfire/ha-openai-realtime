@@ -355,8 +355,17 @@ fighting ESPHome's `packages:` list-concat merge behavior:
 | `voice_pe_base.yaml` | Bulk (~1200 lines) of firmware logic. NO `external_components`, NO `api.encryption.key`. Cannot be flashed standalone. |
 | `voice_pe_components_local.yaml` | `external_components`, `type: local` for `voice_assistant_websocket`. Used in the local dev loop. |
 | `voice_pe_components_git.yaml` | `external_components`, `type: git`. Used by ESPHome instances that don't have this repo cloned. |
-| `voice_pe_config.yaml` | Thin wrapper for the default `ha-voice-openai` device. `just flash` targets this. |
+| `voice_pe_config.yaml` | Thin wrapper for the default speaker (hostname `voice-<MAC suffix>`, matching stock HA Voice PE naming). `just flash` targets this. |
 | `voice_pe_example.yaml` | Template wrapper showing both flavors for additional speakers. |
+
+The default `device_name` in `voice_pe_base.yaml` is `voice`, which
+combined with `name_add_mac_suffix: true` produces hostname
+`voice-<MAC suffix>.local` per device — the same scheme the stock HA
+Voice PE firmware uses. That means per-device wrappers normally do
+NOT override `device_name`: the MAC suffix gives each physical unit
+a unique hostname automatically, and this firmware can OTA-replace a
+factory-fresh Voice PE without a USB step. Override `device_name`
+only if you want a non-stock hostname (e.g. `kitchen-<MAC>.local`).
 
 **Flavor A — local `!include` (for compiling from a clone of this
 repo, e.g. your Mac with `just flash device=...`):**
@@ -366,9 +375,6 @@ repo, e.g. your Mac with `just flash device=...`):**
 packages:
   base: !include voice_pe_base.yaml
   components: !include voice_pe_components_local.yaml
-
-substitutions:
-  device_name: voicepe2
 
 api:
   encryption:
@@ -391,7 +397,6 @@ packages:
     files: [home-assistant-voice-pe/voice_pe_components_git.yaml]
 
 substitutions:
-  device_name: voicepe2
   # ESPHome resolves `file:` paths in packaged YAMLs against the
   # consuming wrapper's directory, not the package cache, so the
   # base's `wake_sound.flac` (a relative path) won't be findable in

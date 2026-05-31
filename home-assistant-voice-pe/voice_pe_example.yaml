@@ -46,11 +46,21 @@ packages:
 #     ref: main
 #     files: [home-assistant-voice-pe/voice_pe_components_git.yaml]
 
-substitutions:
-  device_name: voice_pe_example
-  # For flavor B uncomment this so ESPHome fetches the wake-word
-  # sound file from github rather than expecting it on local disk:
-  # wake_word_triggered_sound_file: https://raw.githubusercontent.com/brettfire/ha-openai-realtime/main/home-assistant-voice-pe/wake_sound.flac
+# By default this wrapper inherits `device_name: voice` from the
+# base, which combined with `name_add_mac_suffix: true` produces a
+# stock-style `voice-<MAC suffix>.local` hostname per device — the
+# same scheme the factory Voice PE firmware uses, so this wrapper
+# can OTA-replace stock with no USB step. Override only if you want
+# a non-standard hostname.
+#
+# substitutions:
+#   device_name: voice_pe_example
+
+# Flavor B (git package, dashboard install) only: uncomment so
+# ESPHome fetches the wake-word audio from github rather than
+# expecting it on the local filesystem.
+# substitutions:
+#   wake_word_triggered_sound_file: https://raw.githubusercontent.com/brettfire/ha-openai-realtime/main/home-assistant-voice-pe/wake_sound.flac
 
 api:
   encryption:

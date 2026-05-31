@@ -30,7 +30,8 @@ cp secrets.yaml.example secrets.yaml
 Edit `secrets.yaml`:
 - `wifi_ssid` / `wifi_password`: WiFi network (shared across devices)
 - `api_encryption_key`: HA API encryption key for the default
-  speaker (`ha-voice-openai`). Per-device entries (e.g.
+  speaker (hostname `voice-<MAC suffix>.local`, matching the stock
+  Voice PE naming convention). Per-device entries (e.g.
   `api_encryption_key_voicepe2`) are added when you onboard
   additional speakers — see [Multi-device setup](#multi-device-setup).
 - `ota_password`: Password for OTA updates (shared)
@@ -59,10 +60,16 @@ Or run `poetry run esphome ...` directly if you prefer.
 The firmware is split into composable shards (`voice_pe_base.yaml`
 + `voice_pe_components_local.yaml` + `voice_pe_components_git.yaml`)
 so per-device wrappers can stay small. `voice_pe_config.yaml` itself
-is a wrapper for the default `ha-voice-openai` speaker.
+is a wrapper for the default speaker (hostname `voice-<MAC suffix>`,
+matching stock Voice PE so first-time OTA-from-stock works without a
+USB step).
 
 For a second speaker, create a tiny per-device wrapper next to
-`voice_pe_base.yaml` (template: `voice_pe_example.yaml`):
+`voice_pe_base.yaml` (template: `voice_pe_example.yaml`). Because
+`name_add_mac_suffix: true` in the base appends a unique per-device
+MAC suffix, you do NOT need to override `device_name` — each
+physical unit gets its own `voice-XXXXXX.local` automatically. Just
+point at a distinct per-device API key:
 
 ```yaml
 # voice_pe_voicepe2.yaml
@@ -70,13 +77,13 @@ packages:
   base: !include voice_pe_base.yaml
   components: !include voice_pe_components_local.yaml
 
-substitutions:
-  device_name: voicepe2
-
 api:
   encryption:
     key: !secret api_encryption_key_voicepe2
 ```
+
+If you want a non-stock hostname (e.g. `kitchen-<MAC suffix>.local`),
+add a `substitutions: { device_name: kitchen }` block to the wrapper.
 
 Add the per-device key to `secrets.yaml`:
 

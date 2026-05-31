@@ -1,10 +1,15 @@
-# Default-device wrapper. Flashes the original `ha-voice-openai`
-# speaker. Compile this with `just flash` or `poetry run esphome run
+# Default-device wrapper. Flashes a speaker using the stock HA Voice
+# PE naming convention (`voice-<MAC suffix>.local`), so this wrapper
+# can OTA-replace any factory-fresh Voice PE without a USB step.
+# Compile with `just flash` or `poetry run esphome run
 # voice_pe_config.yaml`.
 #
 # For additional speakers, copy voice_pe_example.yaml to
 # voice_pe_<name>.yaml and edit. See AGENTS.md / the
-# home-assistant-voice-pe README for the multi-device pattern.
+# home-assistant-voice-pe README for the multi-device pattern. The
+# `device_name` substitution is inherited from voice_pe_base.yaml
+# (defaults to `voice`); per-device wrappers only need to override
+# the `!secret` reference for the API encryption key.
 #
 # Structure (why the file is small):
 #   voice_pe_base.yaml              — all the firmware logic (1200 lines).
@@ -24,9 +29,6 @@
 packages:
   base: !include voice_pe_base.yaml
   components: !include voice_pe_components_local.yaml
-
-substitutions:
-  device_name: ha-voice-openai
 
 api:
   encryption:

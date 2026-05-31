@@ -22,7 +22,10 @@
 # 2. Edit the server_url in secrets.yaml with your Home Assistant IP and port:
 #    server_url: "ws://192.168.1.10:8080"  # Replace with your values
 #
-# 3. Adjust device name if needed (currently: ha-voice-openai)
+# 3. Adjust device name if needed (default: `voice`, which combined
+#    with `name_add_mac_suffix: true` below resolves to
+#    `voice-<last-3-bytes-of-MAC>.local` — same convention as the
+#    stock Home Assistant Voice PE firmware).
 #
 # 4. Compile and install:
 #    esphome compile voice_pe_config.yaml
@@ -30,14 +33,21 @@
 
 substitutions:
   # ===== Per-device identity =====
-  # device_name sets the ESPHome node hostname (`<name>.local`). For
-  # multiple physical devices, do NOT just override this and the api
-  # encryption key on the CLI — ESPHome doesn't expand substitutions
-  # inside `!secret` tags, so the api key has to be resolved via a
-  # tiny per-device wrapper YAML in `devices/`. See the README of
-  # this directory for the per-device pattern. The default below is
-  # the original single-device name.
-  device_name: ha-voice-openai
+  # device_name sets the ESPHome node hostname. Combined with
+  # `name_add_mac_suffix: true` (see `esphome:` below) the actual
+  # mDNS hostname becomes `${device_name}-<MAC suffix>.local`. The
+  # default `voice` matches the stock HA Voice PE firmware, so this
+  # firmware can OTA-replace a stock device without a USB step (the
+  # compiled hostname matches what the stock device advertises).
+  #
+  # For multiple physical devices, do NOT just override this and the
+  # api encryption key on the CLI — ESPHome doesn't expand
+  # substitutions inside `!secret` tags, so the api key has to be
+  # resolved via a tiny per-device wrapper YAML. See the README of
+  # this directory for the per-device pattern. You can leave
+  # `device_name` at the default `voice` on every wrapper — the MAC
+  # suffix gives each physical unit a unique hostname automatically.
+  device_name: voice
 
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
