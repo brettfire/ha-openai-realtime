@@ -3,6 +3,125 @@
 Operational notes for AI agents (Claude Code etc.) working in this repo.
 Humans should read [README.md](README.md) first.
 
+## Behavior contract
+
+What the system is *supposed* to do — independent of how it's
+implemented today. Use this section to spot regressions or to answer
+"is this a bug or by-design?" questions. If you change the implementation
+to deliberately deviate from any of these, **update this section**.
+
+### Conversation lifecycle
+
+1. **Wake word.** The Voice PE satellite runs `micro_wake_word`
+   locally and listens continuously (even when "idle"). On detection
+   it opens a WebSocket to the addon at `ws://<host>:10245/` and
+   begins streaming mic audio.
+2. **Session create.** Each WebSocket connection creates a new
+   `OpenAIRealtimeLLMService` on the addon side, which opens a
+   WebSocket to OpenAI's Realtime API. If a cached conversation
+   context exists for this client_id within the
+   `session_reuse_timeout_seconds` window (default 300s), the
+   previous turn's messages are restored into the new session so
+   the user can continue naturally.
+3. **Turn.** User speaks → OpenAI VAD detects end-of-turn → model
+   responds (audio + tool calls) → audio plays through the satellite
+   speaker. The model can call HA Assist tools mid-response
+   (HassTurnOn/Off, GetDateTime, GetLiveContext, scenes/scripts).
+4. **Silence detection.** After the bot stops speaking, both sides
+   start an inactivity timer. Once the satellite's
+   `AUTO_STOP_INACTIVITY_MS` (20s, in firmware) elapses with no new
+   speaker audio, the satellite closes the WebSocket. The addon
+   caches the conversation context and shuts down the OpenAI
+   session cleanly.
+5. **Idle.** Within `session_reuse_timeout_seconds` of the
+   disconnect, the satellite (still listening locally) waiting for
+   the next wake word can resume with full prior context. Past that
+   window the cached context is dropped — next wake word starts fresh.
+
+### Barge-in modes (HA `select.<device>_barge_in_mode`)
+
+The satellite exposes a HA select entity controlling how the user
+can interrupt the bot mid-speech. Both modes share the same server
+side; only the satellite's audio-streaming behavior changes.
+
+- **Wake Word Only (default, safe).** While the bot is speaking the
+  satellite **mutes** its mic stream so playback echo can't reach
+  OpenAI. The only way to interrupt is to say the wake word — local
+  `micro_wake_word` detects it, the satellite sends a
+  `{"type":"interrupt"}` JSON text frame on the open WebSocket, the
+  addon's `RawAudioSerializer` translates that into a pipecat
+  `InterruptionFrame` which propagates through the pipeline. The
+  bot's response cancels immediately, speaker stops, satellite
+  starts streaming mic for the next turn. **No ambient-noise false
+  triggers.** This is what most users want.
+
+- **Full Duplex.** The mic keeps streaming during playback (relies
+  on the Voice PE's hardware AEC). OpenAI's server-side VAD detects
+  user speech during the bot's response and cancels the response
+  automatically — same mechanism Realtime API uses everywhere.
+  Snappier ("just talk over it"), matches the ChatGPT app
+  experience, but **vulnerable to false triggers** from background
+  noise, TV, music, kids, etc. AEC is good on the Voice PE
+  hardware but not perfect. The wake-word interrupt path still
+  works in this mode as a fallback.
+
+### Session limits and edges
+
+- **OpenAI's 60-minute hard cap.** Any single Realtime API session
+  is killed after 60 minutes of wall-clock time, regardless of
+  activity. Past this point sending events on the WS yields
+  `1001 (going away) Your session hit the maximum duration of 60
+  minutes`. The addon shuts down OpenAI sessions on every client
+  disconnect, so under normal short-conversation use you should
+  never hit this. If you do (a continuous 60-min conversation, or
+  a leak we missed), expect one logged `session_expired` ErrorFrame
+  and a fresh session on the next wake word. **No log-spam
+  cascade** — that was the bug fixed in v0.2.14 / v0.2.16.
+
+- **One client per addon.** Pipecat's `WebsocketServerTransport`
+  allows only one active WebSocket at a time. If a second satellite
+  connects while one is already active, the older connection is
+  dropped (`"Only one client allowed, using new connection"`). For
+  multi-satellite deployments each satellite should hit a separate
+  addon instance.
+
+- **Wake word during bot speech in wake-word mode.** Designed to
+  feel like an interrupt: the bot stops mid-sentence and listens
+  for the user's next turn. Currently the speaker drops audio
+  cleanly and the session continues without reconnect — the
+  earlier "reconnect-and-restart" symptom was the pre-v0.2.13
+  serializer bug (no `on_client_message` handler on pipecat
+  0.0.97; fixed by handling the JSON in the serializer).
+
+- **Long bot answers.** The model can produce 30-60 second
+  responses. During this time in wake-word mode the user is muted
+  client-side; in full-duplex they can talk over it.
+
+- **Tool-call latency.** When the model invokes a tool (HassTurnOn,
+  GetLiveContext, etc.), it pauses speaking, MCP round-trips
+  through HA's `mcp_server` (typical 200-500ms), then resumes. The
+  pause is audible but expected. `GetLiveContext`-style state
+  queries get pre-injected via the snapshot resource (HA 2026.5+)
+  so simple state questions usually don't need a runtime tool call.
+
+### Failure modes worth catching
+
+- **mDNS doesn't resolve `<device_name>.local`** → flashing fails
+  ("All specified devices ['OTA'] could not be resolved"). Fix:
+  set `api: use_address: <ip>` in the per-device wrapper, or
+  enable mDNS forwarding on the AP.
+- **Addon can't reach HA's MCP server** → no Assist prompt loaded,
+  no entity catalog, model guesses entity names → "spotty device
+  finding". Check `homeassistant_api: true` is in the addon's
+  config.yaml and that `ha_mcp_url` is `http://supervisor/core/api/mcp`.
+- **OpenAI key invalid / out of quota** → addon starts but session
+  creation fails. Surfaces as the bot never speaking after a wake
+  word. Check `openai_api_key` in addon options.
+- **Satellite already in another HA's ESPHome dashboard** (adopted
+  by someone else's HAOS) → its API key won't match yours →
+  device entities go `unavailable`. Fix: re-flash from your side
+  with a fresh `api_encryption_key_<device>`.
+
 ## Quick reference: justfile
 
 Most dev-loop commands are recipes in `/justfile`. Run `just` (no args)
