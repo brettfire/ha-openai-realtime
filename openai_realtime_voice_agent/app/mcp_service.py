@@ -8,6 +8,33 @@ from pipecat.services.mcp_service import MCPClient, StreamableHttpParameters
 logger = logging.getLogger(__name__)
 
 
+def _log_unwrapped(action: str, exc: BaseException) -> None:
+    """Log an exception including any wrapped sub-exceptions.
+
+    anyio TaskGroup / Python BaseExceptionGroup hide the real cause
+    behind a generic "unhandled errors in a TaskGroup (N sub-exception)"
+    string. Unwrap so we can actually see what broke.
+    """
+    if isinstance(exc, BaseExceptionGroup):
+        logger.warning(
+            "⚠️ Failed to %s (group of %d): %s",
+            action,
+            len(exc.exceptions),
+            exc,
+        )
+        for i, sub in enumerate(exc.exceptions):
+            logger.warning(
+                "    sub-exception %d: %s: %s",
+                i,
+                type(sub).__name__,
+                sub,
+            )
+    else:
+        logger.warning(
+            "⚠️ Failed to %s: %s: %s", action, type(exc).__name__, exc
+        )
+
+
 class HomeAssistantMCPService:
     """Home Assistant MCP service using Pipecat's MCPClient."""
 
@@ -84,6 +111,7 @@ class HomeAssistantMCPService:
         )
         prompt_text: Optional[str] = None
         snapshot_text: Optional[str] = None
+        snapshot_uri = "homeassistant://assist/context-snapshot"
         async with streamablehttp_client(url=self.url, headers=headers) as (
             read_stream,
             write_stream,
@@ -92,26 +120,50 @@ class HomeAssistantMCPService:
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
 
-                # Default prompt (entity catalog, etc.)
-                prompts_result = await session.list_prompts()
-                if prompts_result.prompts:
-                    prompt_result = await session.get_prompt(
-                        prompts_result.prompts[0].name
+                # Default prompt (entity catalog, etc.). Best-effort; a
+                # failure here shouldn't suppress the snapshot fetch.
+                try:
+                    prompts_result = await session.list_prompts()
+                    if prompts_result.prompts:
+                        prompt_result = await session.get_prompt(
+                            prompts_result.prompts[0].name
+                        )
+                        if prompt_result.messages:
+                            prompt_text = getattr(
+                                prompt_result.messages[0].content,
+                                "text",
+                                None,
+                            )
+                except BaseException as e:  # noqa: BLE001 — unwrap below
+                    _log_unwrapped(
+                        "fetch Assist prompt", e
                     )
-                    if prompt_result.messages:
-                        prompt_text = getattr(
-                            prompt_result.messages[0].content, "text", None
-                        )
 
-                # Live-context snapshot (current entity states)
-                resources_result = await session.list_resources()
-                snapshot_uri = "homeassistant://assist/context-snapshot"
-                if any(str(r.uri) == snapshot_uri for r in resources_result.resources):
-                    read_result = await session.read_resource(snapshot_uri)
-                    if read_result.contents:
-                        snapshot_text = getattr(
-                            read_result.contents[0], "text", None
-                        )
+                # Live-context snapshot (current entity states). Pass the
+                # AnyUrl object returned by list_resources verbatim so the
+                # HA server's `str(uri) == SNAPSHOT_RESOURCE_URI` check
+                # passes — pydantic may normalize a raw string and break
+                # equality.
+                try:
+                    resources_result = await session.list_resources()
+                    matching = next(
+                        (
+                            r
+                            for r in resources_result.resources
+                            if str(r.uri) == snapshot_uri
+                        ),
+                        None,
+                    )
+                    if matching is not None:
+                        read_result = await session.read_resource(matching.uri)
+                        if read_result.contents:
+                            snapshot_text = getattr(
+                                read_result.contents[0], "text", None
+                            )
+                except BaseException as e:  # noqa: BLE001 — unwrap below
+                    _log_unwrapped(
+                        "fetch live-context snapshot", e
+                    )
 
         return (prompt_text, snapshot_text)
 
