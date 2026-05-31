@@ -263,15 +263,38 @@ substitutions:
 api:
   encryption:
     key: !secret api_encryption_key_voicepe2
+
+# REQUIRED for flavor B. The base ships
+# `external_components: type: local, path: esphome/components` which
+# resolves against the *consuming YAML's* working directory, not the
+# cached package — so when there's no repo cloned next to the wrapper
+# (which is the whole point of using flavor B), the local source
+# isn't found and compile fails. We override the full list to use
+# git for both components. voice_kit is re-declared because ESPHome
+# `packages:` REPLACES lists wholesale rather than merging them.
+external_components:
+  - source:
+      type: git
+      url: https://github.com/brettfire/ha-openai-realtime
+      ref: main
+      path: home-assistant-voice-pe/esphome/components
+    components: [voice_assistant_websocket]
+    refresh: 0s
+  - source:
+      type: git
+      url: https://github.com/esphome/home-assistant-voice-pe
+      ref: 25.11.0
+    components: [voice_kit]
+    refresh: 0s
 ```
 
-Both produce identical firmware. The git form pulls the base + the
-custom `voice_assistant_websocket` component from github at compile
-time. ESPHome resolves the base's `external_components: type: local,
-path: esphome/components` relative to the cached package location,
-where the components exist in the fetched repo tree — so the
-local-source custom component "just works" inside a git-fetched base.
-Verified locally.
+Both produce identical firmware. Flavor B also requires the
+dashboard's `/config/esphome/secrets.yaml` to define
+`api_encryption_key` (placeholder, can equal the per-device key value)
+because the base parses that name at load time even though the
+wrapper's `api.encryption.key` override is what actually ships in
+the firmware. Other shared secrets the base references — `wifi_ssid`,
+`wifi_password`, `ota_password`, `server_url` — must also be there.
 
 For either flavor, add the per-device API key to `secrets.yaml`:
 

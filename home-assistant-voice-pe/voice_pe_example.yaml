@@ -21,10 +21,18 @@
 #   2. Replace `voice_pe_example` everywhere below with your device
 #      name (lowercase, no spaces).
 #   3. Pick ONE of the `packages:` blocks below — delete the other.
+#      If you pick flavor B, ALSO uncomment the external_components
+#      block below it.
 #   4. Add the per-device API key to secrets.yaml:
 #        api_encryption_key_<your-device-name>: "<base64 32 bytes>"
 #      (generate with: openssl rand -base64 32)
-#   5. Flash with `just flash device=<your-device-name>` (local) or
+#   5. For flavor B in the HA ESPHome addon, also make sure the
+#      following are in /config/esphome/secrets.yaml — the base
+#      references them at parse time:
+#        wifi_ssid, wifi_password, ota_password, server_url,
+#        api_encryption_key (placeholder; can be the same value as
+#        your per-device key — it's overridden by the wrapper).
+#   6. Flash with `just flash device=<your-device-name>` (local) or
 #      Install from the HA ESPHome dashboard (git).
 
 # --- Flavor A: local include (delete if using git) ---
@@ -37,6 +45,27 @@ packages:
 #     url: https://github.com/brettfire/ha-openai-realtime
 #     ref: main
 #     files: [home-assistant-voice-pe/voice_pe_config.yaml]
+#
+# # When using flavor B, also override external_components so the
+# # custom voice_assistant_websocket component is fetched from git
+# # (the base's `type: local` only works when the repo is cloned
+# # alongside the YAML — true for flavor A, NOT true for paste-into-
+# # HA-dashboard usage). Re-declares the voice_kit entry too because
+# # ESPHome packages REPLACE lists wholesale rather than merging.
+# external_components:
+#   - source:
+#       type: git
+#       url: https://github.com/brettfire/ha-openai-realtime
+#       ref: main
+#       path: home-assistant-voice-pe/esphome/components
+#     components: [voice_assistant_websocket]
+#     refresh: 0s
+#   - source:
+#       type: git
+#       url: https://github.com/esphome/home-assistant-voice-pe
+#       ref: 25.11.0
+#     components: [voice_kit]
+#     refresh: 0s
 
 substitutions:
   device_name: voice_pe_example

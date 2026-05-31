@@ -93,6 +93,15 @@ ESPHome dashboard with the per-device key added to
 `/config/esphome/secrets.yaml`, ESPHome fetches the base + custom
 component from this repo at compile time.
 
+The git-package wrapper must **also override `external_components`**
+to use git source for the `voice_assistant_websocket` component (the
+base ships `type: local` which only works when the repo is cloned
+alongside the YAML, which isn't true inside the HA addon). And the
+dashboard's secrets.yaml needs a placeholder `api_encryption_key`
+entry (the base parses it at load time, before the wrapper's
+override applies) in addition to the per-device key. See
+`voice_pe_example.yaml`'s flavor B for the full template.
+
 ## Configuration
 
 The main configuration file is `voice_pe_config.yaml`. Key settings:
