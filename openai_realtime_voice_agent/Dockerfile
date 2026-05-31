@@ -10,8 +10,8 @@ FROM ${BUILD_FROM} AS builder
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
 # Install build dependencies
-# Install LLVM 15 from Alpine 3.17 repository (required by llvmlite 0.44.0)
-# This works with hassio-addons/base images which may have newer LLVM versions
+# LLVM 15 from Alpine 3.17 is required to compile llvmlite 0.44.0,
+# the version pipecat-ai 0.0.97 pins transitively via numba==0.61.2.
 RUN \
     apk add --no-cache \
         bash \
@@ -35,41 +35,37 @@ RUN \
 # Switch to bash after installation
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install Poetry 1.x (uses pip's installer directly so it honors
-# PIP_NO_BUILD_ISOLATION). Poetry 2.x runs its own self-installer and
-# the global setuptools below is ignored. Also pin an old setuptools
-# globally; combined with --no-build-isolation it satisfies the build
-# requirements of older C-extension deps (notably llvmlite 0.44.0,
-# pinned transitively by pipecat-ai's numba==0.61.2) without poetry
-# creating a fresh build venv that pulls setuptools>=75 — which would
-# fail with `spawn() got an unexpected keyword argument 'dry_run'`.
-RUN \
-    pip3 install --no-cache-dir --break-system-packages 'poetry<2' \
-    && poetry config virtualenvs.create false \
-    && poetry config virtualenvs.in-project false \
-    && poetry config installer.modern-installation false \
-    && pip3 install --no-cache-dir --break-system-packages 'setuptools<70' 'wheel'
-
-# Copy Poetry configuration files and app directory for package installation
-COPY pyproject.toml poetry.lock* /tmp/
-RUN mkdir -p /tmp/openai_realtime_voice_agent
-COPY app/ /tmp/openai_realtime_voice_agent/app/
-
-# Install dependencies using Poetry
-WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
-ENV POETRY_VIRTUALENVS_CREATE=false
-ENV PIP_NO_BUILD_ISOLATION=1
-# Find and set LLVM_CONFIG path
-RUN \
-    LLVM_CONFIG_PATH=$(which llvm-config || find /usr/bin /usr/local/bin -name llvm-config* 2>/dev/null | head -1) \
-    && echo "LLVM_CONFIG_PATH=$LLVM_CONFIG_PATH" \
-    && export LLVM_CONFIG="${LLVM_CONFIG_PATH:-/usr/bin/llvm-config}" \
-    && echo "Using LLVM_CONFIG=$LLVM_CONFIG" \
-    && rm -f poetry.lock* \
-    && LLVM_CONFIG="$LLVM_CONFIG" POETRY_VIRTUALENVS_CREATE=false poetry install --only=main --no-root --no-interaction --no-ansi \
-    && rm -f pyproject.toml \
-    && rm -rf openai_realtime_voice_agent/
+
+# Pre-install older setuptools + wheel into the system Python BEFORE
+# building any C-extension wheels. We then build with
+# --no-build-isolation so pip reuses these instead of creating a fresh
+# build venv (which would download setuptools>=75, removing
+# Distribution.spawn(dry_run=...) and breaking llvmlite 0.44.0's
+# setup.py with `TypeError: spawn() got an unexpected keyword argument
+# 'dry_run'`).
+RUN pip3 install --no-cache-dir --upgrade 'setuptools<70' 'wheel<0.43'
+
+# Copy frozen requirements (the exact `pip freeze` output of the last
+# successful upstream-built image at ghcr.io/fjfricke/.../v0.1.0). This
+# is the single source of truth for runtime deps — no poetry, no
+# version drift.
+COPY requirements-frozen.txt /tmp/requirements-frozen.txt
+
+# Build llvmlite FIRST, with --no-build-isolation, so it uses the
+# pinned setuptools above. After this step llvmlite is installed and
+# subsequent pip installs won't rebuild it. numpy is a build dep of
+# llvmlite, so pre-install it the same way. Cython is also needed.
+RUN LLVM_CONFIG=/usr/bin/llvm-config pip3 install --no-cache-dir --no-build-isolation \
+        $(grep -E '^(numpy|Cython|cython)==' /tmp/requirements-frozen.txt) \
+    && LLVM_CONFIG=/usr/bin/llvm-config pip3 install --no-cache-dir --no-build-isolation \
+        $(grep -E '^llvmlite==' /tmp/requirements-frozen.txt)
+
+# Install the remainder. By this point llvmlite is satisfied so pip
+# won't rebuild it. Some downstream packages may compile during this
+# step; build isolation is fine for them since they don't share
+# llvmlite's setuptools incompatibility.
+RUN pip3 install --no-cache-dir -r /tmp/requirements-frozen.txt
 
 # Runtime stage - minimal image without build tools
 FROM ${BUILD_FROM}
@@ -92,7 +88,6 @@ RUN \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # Copy installed Python packages from builder stage
-# Find Python site-packages directory and copy packages
 RUN \
     --mount=from=builder,source=/usr/lib,target=/builder-lib \
     --mount=from=builder,source=/usr/local/bin,target=/builder-bin \
