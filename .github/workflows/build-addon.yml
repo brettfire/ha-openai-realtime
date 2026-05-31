@@ -22,6 +22,14 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/openai-realtime-voice-agent
 
+# Cancel any in-flight build for the same branch/PR when a new push lands.
+# Grouped per ref so concurrent builds on different branches don't fight.
+# Saves runner minutes and avoids racing two builds publishing to the same
+# :latest tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build for ${{ matrix.arch }}
