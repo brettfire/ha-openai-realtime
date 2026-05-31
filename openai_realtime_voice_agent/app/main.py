@@ -206,26 +206,45 @@ class Application:
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to fetch MCP tool definitions: {e}")
 
-            # Fetch HA's Assist system prompt (entity list, areas, current
-            # states) and append to our base instructions. This is what
-            # makes regular Assist aware of the user's home — without it,
-            # the OpenAI model has tools but no nouns. Best-effort: if
-            # the MCP server doesn't expose a prompt, fall back to base.
+            # Fetch HA's Assist system prompt (entity list, areas) AND
+            # live-context snapshot (current entity states) and append to
+            # our base instructions. This is what makes regular Assist
+            # aware of the user's home — without it the OpenAI model has
+            # tools but no nouns, and has to call GetLiveContext for
+            # every state question. Best-effort: if the MCP server
+            # doesn't expose either piece, fall back to base.
             session_instructions = self.instructions
             if self.mcp_service:
                 try:
-                    assist_prompt = await self.mcp_service.fetch_assist_prompt()
+                    assist_prompt, context_snapshot = (
+                        await self.mcp_service.fetch_assist_prompt_and_snapshot()
+                    )
+                    extras = []
                     if assist_prompt:
-                        session_instructions = (
-                            f"{self.instructions}\n\n"
-                            f"# Home Assistant context (from MCP server)\n"
+                        extras.append(
+                            "# Home Assistant context (from MCP server)\n"
                             f"{assist_prompt}"
                         )
                         logger.info(
                             f"✅ Loaded HA Assist prompt ({len(assist_prompt)} chars)"
                         )
+                    if context_snapshot:
+                        extras.append(
+                            "# Live entity state snapshot (from MCP server)\n"
+                            f"{context_snapshot}"
+                        )
+                        logger.info(
+                            f"✅ Loaded HA live-context snapshot "
+                            f"({len(context_snapshot)} chars)"
+                        )
+                    if extras:
+                        session_instructions = (
+                            f"{self.instructions}\n\n" + "\n\n".join(extras)
+                        )
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to fetch HA Assist prompt: {e}")
+                    logger.warning(
+                        f"⚠️ Failed to fetch HA Assist prompt / snapshot: {e}"
+                    )
 
             session_properties = SessionProperties(
                 instructions=session_instructions,
