@@ -184,11 +184,67 @@ different wake words ("Hey Jarvis" in office, "Okay Nabu"
 elsewhere), they don't conflict — both can fire concurrently for
 different conversations.
 
-### Why we'd skip the audio-level approach
+### Option B — Audio-level arbitration (deferred)
 
-My original plan (level voting) is more code, more state, and
-likely no real-world quality improvement over the timestamp method
-HA uses. Drop it.
+A more "physically correct" approach: each satellite measures the
+audio level of the wake-word trigger and sends it along with the
+detection. The addon waits a short window (~150-250ms), collects
+all detections of the same phrase, picks the loudest, sends
+`proceed` to the winner and `yield` to the rest.
+
+Wire format:
+```json
+{"type":"wake_word_detected","phrase":"okay_nabu","level_dbfs":-18.4}
+```
+
+What level to send: RMS in dBFS over the audio frames that
+triggered detection (or the last ~250ms of input before the
+trigger fired). micro_wake_word doesn't expose confidence or
+internal probability via its public trigger, so we'd compute level
+in our `voice_assistant_websocket` component from the
+`microphone_source`'s recent samples.
+
+Addon-side arbiter sketch:
+```python
+class LevelArbiter:
+    WINDOW_MS = 200          # how long to wait for late detections
+    EARLY_CUTOFF_DBFS = -10  # if first arrival is this loud,
+                             # skip the window and proceed
+    def __init__(self):
+        self._pending: dict[str, list[tuple[str, float, float]]] = {}
+        # phrase -> [(client_id, level_dbfs, ts)]
+
+    async def claim(self, client_id, phrase, level_dbfs) -> bool:
+        # ... collect, sleep WINDOW_MS, return True if we're the
+        # loudest entry for this phrase ...
+```
+
+Trade-offs vs. Option A (HA's timestamp approach):
+
+| | Option A (timestamp) | Option B (level) |
+|---|---|---|
+| Picks closest satellite | Usually (correlates with detect time) | More directly |
+| Added latency | 0ms | ~150-250ms window |
+| Code | ~30 LOC Python + ~30 C++ | ~80 LOC Python + ~60 C++ |
+| Failure mode if level reporting is broken on one sat | N/A | That sat always wins or always loses |
+| Handles "equidistant satellites" cleanly | Coin flip | Coin flip (levels within noise floor) |
+| Tracks HA's mainline behavior | Yes | No (we'd be alone in this design) |
+
+The latency cost is the real issue: 200ms before any "Hi, I heard
+you" feedback is perceptible. Option A is instant.
+
+A hybrid is possible: do Option A as the fast path, but if a
+second detection arrives within ~50ms with a level that's
+significantly higher (e.g. +6 dBFS), override the winner and send
+`yield` to the original. This recovers most of B's accuracy
+without paying the full window cost on the common single-satellite
+case.
+
+**Recommendation: ship Option A first.** Only consider B (or the
+hybrid) if real-world testing shows Option A picks the wrong
+satellite often enough to be annoying. The cost — 200ms of "did
+it hear me?" silence on every wake word — is bigger than most
+users would pay to fix an edge case.
 
 ### Open question: cooldown value
 
