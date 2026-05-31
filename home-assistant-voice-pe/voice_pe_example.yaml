@@ -1,0 +1,26 @@
+# Per-device wrapper TEMPLATE for adding additional Voice PE speakers.
+#
+# Copy this to `voice_pe_<your-device-name>.yaml` (same directory),
+# replace `voice_pe_example` everywhere below with your device name,
+# add a matching per-device key to secrets.yaml:
+#
+#   api_encryption_key_<your-device-name>: "<base64-32-bytes>"
+#
+# Then flash with:
+#   just flash device=<your-device-name>
+# or:
+#   poetry run esphome run voice_pe_<your-device-name>.yaml
+#
+# The default speaker (ha-voice-openai) doesn't need a wrapper —
+# `just flash` / `poetry run esphome run voice_pe_config.yaml` still
+# flashes that one using the original `api_encryption_key` secret.
+
+packages:
+  base: !include voice_pe_config.yaml
+
+substitutions:
+  device_name: voice_pe_example
+
+api:
+  encryption:
+    key: !secret api_encryption_key_voice_pe_example

@@ -223,6 +223,56 @@ For OTA flashing the device must be reachable on the network with the
 encryption key in `secrets.yaml`. For initial USB flashing the device
 must be in download mode (hold BOOT, plug in USB).
 
+### Multi-device pattern (one base YAML, per-device wrappers)
+
+`voice_pe_config.yaml` is the base config and also the default
+flashable for the original `ha-voice-openai` device. For additional
+speakers, create a tiny per-device wrapper next to the base named
+`voice_pe_<device_name>.yaml`:
+
+```yaml
+# voice_pe_voicepe2.yaml
+packages:
+  base: !include voice_pe_config.yaml
+
+substitutions:
+  device_name: voicepe2
+
+api:
+  encryption:
+    key: !secret api_encryption_key_voicepe2
+```
+
+Then add the per-device key to `secrets.yaml`:
+
+```yaml
+api_encryption_key_voicepe2: "<unique base64 32 bytes>"
+```
+
+And flash with the justfile:
+
+```sh
+just flash device=voicepe2
+just logs device=voicepe2
+just validate device=voicepe2
+```
+
+Why this pattern instead of substitution-into-secret-name:
+ESPHome **doesn't expand substitutions inside `!secret` tags** —
+they're literal lookups. So `!secret api_encryption_key_${var}`
+looks up the literal key name `api_encryption_key_${var}` and fails.
+The wrapper pattern works around it cleanly using ESPHome's
+`packages:` deep-merge: the wrapper inherits everything from the
+base, then overrides only the substitutions and the api key.
+
+Wrappers MUST live in the same directory as the base YAML, not in a
+subdirectory like `devices/` — the base's `external_components:
+type: local, path: esphome/components` is resolved relative to the
+compiled YAML's directory, so a wrapper in `devices/` would look for
+`devices/esphome/components/` which doesn't exist.
+
+`voice_pe_example.yaml` is a template — copy it, rename, edit.
+
 ### After a `.cpp` / `.h` change in the custom component
 
 The change is to `home-assistant-voice-pe/esphome/components/voice_assistant_websocket/`.

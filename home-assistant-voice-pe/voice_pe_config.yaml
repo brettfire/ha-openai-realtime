@@ -29,6 +29,16 @@
 #    esphome upload voice_pe_config.yaml
 
 substitutions:
+  # ===== Per-device identity =====
+  # device_name sets the ESPHome node hostname (`<name>.local`). For
+  # multiple physical devices, do NOT just override this and the api
+  # encryption key on the CLI — ESPHome doesn't expand substitutions
+  # inside `!secret` tags, so the api key has to be resolved via a
+  # tiny per-device wrapper YAML in `devices/`. See the README of
+  # this directory for the per-device pattern. The default below is
+  # the original single-device name.
+  device_name: ha-voice-openai
+
   # Voice Assistant Phase IDs (for state management)
   voice_assist_idle_phase_id: '1'
   voice_assist_waiting_for_command_phase_id: '2'
@@ -42,7 +52,7 @@ substitutions:
   wake_word_triggered_sound_file: wake_sound.flac
 
 esphome:
-  name: ha-voice-openai
+  name: ${device_name}
   friendly_name: Home Assistant OpenAI Realtime Voice
   name_add_mac_suffix: true
   min_version: 2025.11.0

@@ -9,7 +9,7 @@ default:
     @just --list
 
 # ---------------------------------------------------------------------------
-# Variables (override on the command line: `just upstream_ref=main diff-upstream`)
+# Variables (override on the command line)
 # ---------------------------------------------------------------------------
 
 # Upstream HA Voice PE repo we diff against.
@@ -21,6 +21,15 @@ upstream_ref := "25.11.0"
 # Path to Docker CLI on macOS Docker Desktop (not in default PATH).
 docker := "/Applications/Docker.app/Contents/Resources/bin/docker"
 
+# Per-device YAML selector. Default `config` flashes the base
+# voice_pe_config.yaml (which targets the original ha-voice-openai
+# speaker). For an additional speaker, create a tiny per-device
+# wrapper named `voice_pe_<name>.yaml` (template:
+# voice_pe_example.yaml) and call:
+#   just flash device=<name>
+# Recipes that touch the firmware all honor this variable.
+device := "config"
+
 # Serial port for USB flashing. Override per recipe call.
 port := "/dev/cu.usbmodem*"
 
@@ -28,29 +37,29 @@ port := "/dev/cu.usbmodem*"
 # ESPHome firmware (Voice PE satellite)
 # ---------------------------------------------------------------------------
 
-# Validate voice_pe_config.yaml without compiling.
+# Validate the YAML without compiling (e.g. `just validate device=voicepe2`).
 validate:
-    cd home-assistant-voice-pe && poetry run esphome config voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome config voice_pe_{{device}}.yaml
 
-# Compile the firmware (no flash, no logs).
+# Compile only (no flash, no logs).
 compile:
-    cd home-assistant-voice-pe && poetry run esphome compile voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome compile voice_pe_{{device}}.yaml
 
 # Compile, OTA-flash the device, and stream logs (default dev loop).
 flash:
-    cd home-assistant-voice-pe && poetry run esphome run voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome run voice_pe_{{device}}.yaml
 
 # USB-flash via serial. Override port: `just port=/dev/cu.usbserial-1234 flash-usb`.
 flash-usb:
-    cd home-assistant-voice-pe && poetry run esphome run --device {{port}} voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome run --device {{port}} voice_pe_{{device}}.yaml
 
 # Stream logs from the already-running device.
 logs:
-    cd home-assistant-voice-pe && poetry run esphome logs voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome logs voice_pe_{{device}}.yaml
 
-# Wipe esphome build cache (forces a fresh compile).
+# Wipe esphome build cache for the selected device (forces a fresh compile).
 clean:
-    cd home-assistant-voice-pe && poetry run esphome clean voice_pe_config.yaml
+    cd home-assistant-voice-pe && poetry run esphome clean voice_pe_{{device}}.yaml
 
 # Default ref is the version we pin in external_components; override with
 # `just upstream_ref=main diff-upstream` to compare against the latest.
