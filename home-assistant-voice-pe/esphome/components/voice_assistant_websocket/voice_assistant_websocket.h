@@ -204,7 +204,7 @@ template<typename... Ts> class VoiceAssistantWebSocketSetBargeInModeAction : pub
  public:
   VoiceAssistantWebSocketSetBargeInModeAction(VoiceAssistantWebSocket *parent) : parent_(parent) {}
   TEMPLATABLE_VALUE(BargeInMode, mode)
-  void play(Ts... x) override {
+  void play(const Ts &...x) override {
     this->parent_->set_barge_in_mode(this->mode_.value(x...));
   }
  protected:
