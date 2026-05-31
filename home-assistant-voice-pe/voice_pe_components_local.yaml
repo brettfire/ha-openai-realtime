@@ -1,0 +1,26 @@
+# external_components shard — LOCAL source for voice_assistant_websocket.
+#
+# Use this from a wrapper YAML that lives in a checked-out copy of
+# this repo (so the relative path `esphome/components` resolves):
+#
+#   packages:
+#     base: !include voice_pe_config.yaml
+#     components: !include voice_pe_components_local.yaml
+#
+# Picks up uncommitted .cpp/.h changes in the custom component
+# immediately — required for the local dev loop. For ESPHome
+# instances that don't have this repo cloned alongside the YAML
+# (the HA ESPHome Device Builder addon), use
+# voice_pe_components_git.yaml instead.
+
+external_components:
+  - source:
+      type: local
+      path: esphome/components
+    components: [voice_assistant_websocket]
+  - source:
+      type: git
+      url: https://github.com/esphome/home-assistant-voice-pe
+      ref: 25.11.0
+    components: [voice_kit]
+    refresh: 0s

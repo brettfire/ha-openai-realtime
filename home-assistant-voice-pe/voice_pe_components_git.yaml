@@ -1,0 +1,37 @@
+# external_components shard — GIT source for voice_assistant_websocket.
+#
+# Use this from a wrapper YAML in an ESPHome instance that does NOT
+# have this repo cloned (the HA ESPHome Device Builder addon,
+# someone else's machine, a Codespace, etc.):
+#
+#   packages:
+#     base:
+#       url: https://github.com/brettfire/ha-openai-realtime
+#       ref: main
+#       files: [home-assistant-voice-pe/voice_pe_config.yaml]
+#     components:
+#       url: https://github.com/brettfire/ha-openai-realtime
+#       ref: main
+#       files: [home-assistant-voice-pe/voice_pe_components_git.yaml]
+#
+# The base file (voice_pe_config.yaml) has NO external_components of
+# its own — it's purely the firmware logic. The "components"
+# package above is what wires in voice_assistant_websocket
+# (from git) and voice_kit. For the local dev loop on a checked-out
+# copy of this repo, use voice_pe_components_local.yaml instead so
+# uncommitted .cpp/.h changes are picked up without push/pull.
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/brettfire/ha-openai-realtime
+      ref: main
+      path: home-assistant-voice-pe/esphome/components
+    components: [voice_assistant_websocket]
+    refresh: 0s
+  - source:
+      type: git
+      url: https://github.com/esphome/home-assistant-voice-pe
+      ref: 25.11.0
+    components: [voice_kit]
+    refresh: 0s

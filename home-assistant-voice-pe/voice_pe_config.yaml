@@ -28,6 +28,14 @@
 #    esphome compile voice_pe_config.yaml
 #    esphome upload voice_pe_config.yaml
 
+# Bundle the LOCAL-source external_components shard. When this YAML
+# is compiled directly (the default `just flash` path), uncommitted
+# .cpp/.h changes in esphome/components/voice_assistant_websocket/
+# are picked up immediately. For HA-dashboard onboarding the wrapper
+# uses voice_pe_components_git.yaml instead — see voice_pe_example.yaml.
+packages:
+  components: !include voice_pe_components_local.yaml
+
 substitutions:
   # ===== Per-device identity =====
   # device_name sets the ESPHome node hostname (`<name>.local`). For
@@ -1085,37 +1093,13 @@ micro_wake_word:
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
 
-# External Components - Custom voice_assistant_websocket component
-external_components:
-  # Custom Voice Assistant WebSocket Component (local source — default).
-  # This means esphome compile picks up uncommitted .cpp/.h changes
-  # immediately, which is what we want for the active dev loop on a
-  # checked-out copy of this repo.
-  #
-  # If you're adopting this YAML inside HA's ESPHome Device Builder
-  # addon (or any other ESPHome instance that does NOT have this repo
-  # cloned next to the YAML), swap the block below for the git source
-  # so the addon can fetch the component on its own:
-  #
-  #   - source:
-  #       type: git
-  #       url: https://github.com/brettfire/ha-openai-realtime
-  #       ref: main
-  #       path: home-assistant-voice-pe/esphome/components
-  #     components: [voice_assistant_websocket]
-  #     refresh: 0s
-  - source:
-      type: local
-      path: esphome/components
-    components: [voice_assistant_websocket]
-  # Voice PE Hardware Components
-  - source:
-      type: git
-      url: https://github.com/esphome/home-assistant-voice-pe
-      ref: 25.11.0
-    components:
-      - voice_kit
-    refresh: 0s
+# External Components are NOT defined here. They live in shards so
+# wrappers can choose between LOCAL source (for repo-cloned dev) and
+# GIT source (for the HA ESPHome Device Builder addon / standalone).
+# This file (voice_pe_config.yaml) flashes the default device and
+# bundles the local-source shard via the `packages:` block at the
+# top — see substitutions section. Additional devices use a wrapper
+# that picks the right shard. See voice_pe_example.yaml.
 
 # Barge-in mode — surfaced to Home Assistant as
 # `select.<device>_barge_in_mode`. "Wake Word Only" keeps the mic muted
