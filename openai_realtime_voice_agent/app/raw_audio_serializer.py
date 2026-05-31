@@ -81,17 +81,20 @@ class RawAudioSerializer(FrameSerializer):
             num_channels=1,
         )
     
-    async def serialize(self, frame: Frame) -> bytes:
+    async def serialize(self, frame: Frame) -> str | bytes | None:
         """Serialize frame to binary message.
         
-        For output audio frames, we just return the raw audio bytes.
-        Other frames are not serialized (return empty bytes).
+        For output audio frames, return raw audio bytes. For interruption
+        frames, send a text control message so the satellite can stop local
+        playback and clear buffered audio.
         """
         if isinstance(frame, OutputAudioRawFrame):
             audio_bytes = frame.audio
             logger.debug(f"📤 Serializing OutputAudioRawFrame: {len(audio_bytes)} bytes")
             return audio_bytes
-        # For other frame types, return empty bytes (not serialized)
-        logger.debug(f"📤 Serializing non-audio frame: {type(frame).__name__}, returning empty bytes")
-        return b""
-
+        if isinstance(frame, InterruptionFrame):
+            logger.info("📤 Serializing InterruptionFrame control message")
+            return json.dumps({"type": "interrupt"})
+        # For other frame types, return None (not serialized)
+        logger.debug(f"📤 Serializing non-audio frame: {type(frame).__name__}, returning None")
+        return None

@@ -109,6 +109,10 @@ addon-smoke:
          print("imports OK; has fetch_assist_prompt_and_snapshot:", \
                hasattr(svc, "fetch_assist_prompt_and_snapshot"))'
 
+# Run the addon's lightweight contract tests.
+addon-test:
+    cd openai_realtime_voice_agent && poetry run python -m unittest discover -s tests
+
 # Pull + verify the latest published addon image from ghcr.io.
 addon-verify-published:
     {{docker}} pull --platform linux/arm64 \

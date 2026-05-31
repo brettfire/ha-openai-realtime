@@ -88,6 +88,15 @@ class Application:
         except Exception as e:
             logger.warning(f"⚠️ Failed to initialize Home Assistant MCP Client: {e}")
         
+        # Initialize audio recording service (optional) before wiring the
+        # WebSocket handler so recorders can be inserted into the pipeline.
+        self.audio_recording_service = AudioRecordingService(
+            enable_recording=enable_recording,
+            sample_rate=24000,
+            chunk_duration_seconds=30,
+            output_dir="recordings"
+        )
+
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
             host=websocket_host,
@@ -104,15 +113,7 @@ class Application:
         self.vad_silence_duration_ms = vad_silence_duration_ms
         self.instructions = instructions
         self.mcp_client = mcp_client
-        
-        # Initialize audio recording service (optional)
-        self.audio_recording_service = AudioRecordingService(
-            enable_recording=enable_recording,
-            sample_rate=24000,
-            chunk_duration_seconds=30,
-            output_dir="recordings"
-        )
-        
+
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
     
     def _build_pipeline_for_transport(self, transport: WebsocketServerTransport, client_id: str):

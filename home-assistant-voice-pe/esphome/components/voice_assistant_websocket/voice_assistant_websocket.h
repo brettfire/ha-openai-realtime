@@ -85,6 +85,7 @@ class VoiceAssistantWebSocket : public Component {
   void send_audio_chunk_(const uint8_t *data, size_t len);
   void process_received_audio_(const uint8_t *data, size_t len);
   void on_microphone_data_(const std::vector<uint8_t> &data);
+  void stop_speaker_after_interrupt_();
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
   
@@ -225,4 +226,3 @@ template<typename... Ts> class VoiceAssistantWebSocketSetBargeInModeAction : pub
 
 }  // namespace voice_assistant_websocket
 }  // namespace esphome
-

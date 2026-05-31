@@ -186,14 +186,11 @@ class WebSocketHandler:
         if self.audio_recording_service:
             logger.info("🎙️ Audio recording enabled - will record input and output audio")
         
-        # Create pipeline runner and task
-        # Disable idle timeout - server should always stay ready for connections
+        # Create pipeline runner and task. Disable idle timeout - server should
+        # always stay ready for connections. The caller owns runner.run(task);
+        # starting it here as well creates a duplicate pipeline lifecycle.
         runner = PipelineRunner()
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
-        
-        # Start pipeline in background
-        asyncio.create_task(runner.run(task))
-        logger.info("✅ Pipeline started for WebSocket connection")
         logger.info("✅ Pipeline initialized successfully")
         
         return pipeline, runner, task
@@ -280,4 +277,3 @@ class WebSocketHandler:
                     await self.transport.stop()
             except Exception as e:
                 logger.warning(f"⚠️ Error stopping transport: {e}")
-

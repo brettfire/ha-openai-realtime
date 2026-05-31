@@ -585,6 +585,28 @@ bool VoiceAssistantWebSocket::is_bot_speaking() const {
   return (millis() - last) < 500;
 }
 
+void VoiceAssistantWebSocket::stop_speaker_after_interrupt_() {
+  if (this->speaker_ != nullptr) {
+    this->speaker_->stop();
+  }
+  // Clear audio queue under the mutex (other tasks may be pushing).
+#ifdef USE_ESP_IDF
+  {
+    AudioQueueLock lock(this->audio_queue_mutex_);
+    if (lock.acquired()) {
+      this->audio_queue_.clear();
+    }
+  }
+#endif
+  // Atomic set — read concurrently by process_received_audio_ on the
+  // websocket task. millis() == 0 is the "no interrupt" sentinel, so
+  // if we happen to land there, bump by 1ms.
+  uint32_t now = millis();
+  if (now == 0) now = 1;
+  this->interrupt_time_.store(now, std::memory_order_relaxed);
+  ESP_LOGI(TAG, "Cleared audio queue and ignoring incoming audio for %u ms", INTERRUPT_IGNORE_AUDIO_MS);
+}
+
 void VoiceAssistantWebSocket::interrupt() {
   esp_websocket_client_handle_t client = this->websocket_client_;
   if (client == nullptr || !esp_websocket_client_is_connected(client)) {
@@ -609,25 +631,7 @@ void VoiceAssistantWebSocket::interrupt() {
   }
 
   ESP_LOGI(TAG, "Interrupt message sent successfully");
-  if (this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
-  // Clear audio queue under the mutex (other tasks may be pushing).
-#ifdef USE_ESP_IDF
-  {
-    AudioQueueLock lock(this->audio_queue_mutex_);
-    if (lock.acquired()) {
-      this->audio_queue_.clear();
-    }
-  }
-#endif
-  // Atomic set — read concurrently by process_received_audio_ on the
-  // websocket task. millis() == 0 is the "no interrupt" sentinel, so
-  // if we happen to land there, bump by 1ms.
-  uint32_t now = millis();
-  if (now == 0) now = 1;
-  this->interrupt_time_.store(now, std::memory_order_relaxed);
-  ESP_LOGI(TAG, "Cleared audio queue and ignoring incoming audio for %u ms", INTERRUPT_IGNORE_AUDIO_MS);
+  this->stop_speaker_after_interrupt_();
 }
 
 void VoiceAssistantWebSocket::websocket_event_handler_(void *handler_args, 
@@ -705,9 +709,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         if (message.find("\"type\":\"interrupt\"") != std::string::npos ||
             message.find("\"type\": \"interrupt\"") != std::string::npos) {
           ESP_LOGI(TAG, "Interrupt received, stopping speaker");
-          if (this->speaker_ != nullptr) {
-            this->speaker_->stop();
-          }
+          this->stop_speaker_after_interrupt_();
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");
@@ -798,4 +800,3 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
 
 }  // namespace voice_assistant_websocket
 }  // namespace esphome
-
