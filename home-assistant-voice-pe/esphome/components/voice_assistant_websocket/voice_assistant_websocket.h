@@ -60,8 +60,8 @@ class VoiceAssistantWebSocket : public Component {
   void request_start();
   void interrupt();  // Send interrupt message to server and stop speaker
 
-  bool is_running() const { return this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
-  bool is_connected() const { return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_); }
+  bool is_running() const { return this->state_.load(std::memory_order_relaxed) == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
+  bool is_connected() const;
   bool is_bot_speaking() const;  // Check if bot is currently speaking (within 500ms of last audio)
 
   // Barge-in mode controls whether mic audio is suppressed while the
@@ -85,6 +85,11 @@ class VoiceAssistantWebSocket : public Component {
   void send_audio_chunk_(const uint8_t *data, size_t len);
   void process_received_audio_(const uint8_t *data, size_t len);
   void on_microphone_data_(const std::vector<uint8_t> &data);
+  bool speaker_is_running_() const;
+  bool speaker_is_stopped_() const;
+  void start_speaker_if_stopped_();
+  void stop_speaker_();
+  size_t play_speaker_(const uint8_t *data, size_t len);
   void stop_speaker_after_interrupt_();
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
@@ -95,10 +100,12 @@ class VoiceAssistantWebSocket : public Component {
   
 #ifdef USE_ESP_IDF
   esp_websocket_client_handle_t websocket_client_{nullptr};
+  mutable SemaphoreHandle_t websocket_client_mutex_{nullptr};
+  mutable SemaphoreHandle_t speaker_mutex_{nullptr};
 #else
   void *websocket_client_{nullptr};
 #endif
-  VoiceAssistantWebSocketState state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
+  std::atomic<VoiceAssistantWebSocketState> state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
   
   std::function<void(VoiceAssistantWebSocketState)> state_callback_;
   
@@ -143,14 +150,14 @@ class VoiceAssistantWebSocket : public Component {
   std::vector<int16_t> mono_buffer_;       // 32-bit stereo -> 16-bit mono (input)
   std::vector<int16_t> resampled_buffer_;  // 16kHz -> 24kHz resampling (1.5x upsampling)
 
-  bool pending_start_{false};
-  bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
-  bool reconnect_pending_{false};
-  bool explicit_disconnect_{false};  // Flag to prevent reconnection after explicit disconnect
-  uint32_t reconnect_attempts_{0};
+  std::atomic<bool> pending_start_{false};
+  std::atomic<bool> pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
+  std::atomic<bool> reconnect_pending_{false};
+  std::atomic<bool> explicit_disconnect_{false};  // Flag to prevent reconnection after explicit disconnect
+  std::atomic<uint32_t> reconnect_attempts_{0};
   static const uint32_t MAX_RECONNECT_ATTEMPTS = 5;
   static const uint32_t RECONNECT_DELAY_MS = 5000;
-  uint32_t last_reconnect_attempt_{0};
+  std::atomic<uint32_t> last_reconnect_attempt_{0};
 
   // Cross-task scalars — same reasoning as last_speaker_audio_time_.
   std::atomic<uint32_t> interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)

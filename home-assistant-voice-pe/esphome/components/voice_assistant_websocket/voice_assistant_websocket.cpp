@@ -16,25 +16,27 @@ namespace esphome {
 namespace voice_assistant_websocket {
 
 #ifdef USE_ESP_IDF
-// Tiny RAII helper so every audio_queue_ touch goes through the mutex.
-class AudioQueueLock {
+// Tiny RAII helper so every cross-task shared resource touch goes through
+// the relevant mutex.
+class MutexLock {
  public:
-  AudioQueueLock(SemaphoreHandle_t mutex, TickType_t timeout = portMAX_DELAY) : mutex_(mutex) {
+  MutexLock(SemaphoreHandle_t mutex, TickType_t timeout = portMAX_DELAY) : mutex_(mutex) {
     locked_ = (mutex_ != nullptr) && (xSemaphoreTake(mutex_, timeout) == pdTRUE);
   }
-  ~AudioQueueLock() {
+  ~MutexLock() {
     if (locked_) {
       xSemaphoreGive(mutex_);
     }
   }
   bool acquired() const { return locked_; }
   // Non-copyable / non-movable.
-  AudioQueueLock(const AudioQueueLock &) = delete;
-  AudioQueueLock &operator=(const AudioQueueLock &) = delete;
+  MutexLock(const MutexLock &) = delete;
+  MutexLock &operator=(const MutexLock &) = delete;
  private:
   SemaphoreHandle_t mutex_;
   bool locked_;
 };
+using AudioQueueLock = MutexLock;
 #endif
 
 void VoiceAssistantWebSocket::setup() {
@@ -46,8 +48,16 @@ void VoiceAssistantWebSocket::setup() {
   if (this->audio_queue_mutex_ == nullptr) {
     ESP_LOGE(TAG, "Failed to create audio_queue_mutex_");
   }
+  this->websocket_client_mutex_ = xSemaphoreCreateMutex();
+  if (this->websocket_client_mutex_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create websocket_client_mutex_");
+  }
+  this->speaker_mutex_ = xSemaphoreCreateMutex();
+  if (this->speaker_mutex_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create speaker_mutex_");
+  }
 #endif
-  this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
+  this->state_.store(VOICE_ASSISTANT_WEBSOCKET_IDLE, std::memory_order_relaxed);
 
   // Register microphone data callback
   if (this->microphone_ != nullptr) {
@@ -64,23 +74,23 @@ void VoiceAssistantWebSocket::loop() {
   // (The old code reset it to false here, which was the reconnect-deadlock
   // bug — events would set reconnect_pending_, then our own disconnect path
   // would immediately clear it, and no reconnect would ever happen.)
-  if (this->pending_disconnect_) {
-    this->pending_disconnect_ = false;
+  if (this->pending_disconnect_.exchange(false, std::memory_order_relaxed)) {
     this->disconnect_websocket_();
 
-    this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
-    if (!this->reconnect_pending_) {
+    this->state_.store(VOICE_ASSISTANT_WEBSOCKET_IDLE, std::memory_order_relaxed);
+    bool reconnect_pending = this->reconnect_pending_.load(std::memory_order_relaxed);
+    if (!reconnect_pending) {
       // Pure stop (no reconnect intent) — reset attempt counter.
-      this->reconnect_attempts_ = 0;
+      this->reconnect_attempts_.store(0, std::memory_order_relaxed);
     }
 
     if (this->state_callback_) {
-      this->state_callback_(this->state_);
+      this->state_callback_(this->state_.load(std::memory_order_relaxed));
     }
 
     // Only treat as a "stopped" event if there's no reconnect coming.
     // Otherwise consumers (LEDs etc.) would flash IDLE in between.
-    if (!this->reconnect_pending_) {
+    if (!reconnect_pending) {
       this->stopped_trigger_.trigger();
       ESP_LOGI(TAG, "Voice Assistant WebSocket stopped");
     } else {
@@ -92,7 +102,7 @@ void VoiceAssistantWebSocket::loop() {
   // Drain queued audio if the speaker is running. The actual play()
   // call happens OUTSIDE the mutex to keep the critical section short.
 #ifdef USE_ESP_IDF
-  if (this->speaker_ != nullptr && this->speaker_->is_running()) {
+  if (this->speaker_is_running_()) {
     std::vector<uint8_t> chunk;
     {
       AudioQueueLock lock(this->audio_queue_mutex_);
@@ -102,7 +112,7 @@ void VoiceAssistantWebSocket::loop() {
       }
     }
     if (!chunk.empty()) {
-      size_t written = this->speaker_->play(chunk.data(), chunk.size());
+      size_t written = this->play_speaker_(chunk.data(), chunk.size());
       if (written == chunk.size()) {
         ESP_LOGD(TAG, "Sent queued audio chunk from loop (%zu bytes)", chunk.size());
       } else if (written > 0 && written < chunk.size()) {
@@ -129,21 +139,32 @@ void VoiceAssistantWebSocket::loop() {
 #endif
 
   // Handle pending start request
-  if (this->pending_start_ && this->state_ == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
-    this->pending_start_ = false;
+  if (this->pending_start_.load(std::memory_order_relaxed) &&
+      this->state_.load(std::memory_order_relaxed) == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
+    this->pending_start_.store(false, std::memory_order_relaxed);
     this->start();
   }
 
   // Handle reconnection (only if not pending disconnect and websocket client is cleaned up)
-  if (this->reconnect_pending_ &&
-      !this->pending_disconnect_ &&
-      this->websocket_client_ == nullptr &&
-      (millis() - this->last_reconnect_attempt_) > RECONNECT_DELAY_MS &&
-      this->reconnect_attempts_ < MAX_RECONNECT_ATTEMPTS) {
-    this->reconnect_pending_ = false;
-    this->last_reconnect_attempt_ = millis();
-    this->reconnect_attempts_++;
-    ESP_LOGW(TAG, "Attempting to reconnect (attempt %u/%u)...", this->reconnect_attempts_, MAX_RECONNECT_ATTEMPTS);
+  bool websocket_client_cleaned_up = false;
+#ifdef USE_ESP_IDF
+  {
+    MutexLock lock(this->websocket_client_mutex_);
+    websocket_client_cleaned_up = lock.acquired() && this->websocket_client_ == nullptr;
+  }
+#else
+  websocket_client_cleaned_up = this->websocket_client_ == nullptr;
+#endif
+  uint32_t reconnect_attempts = this->reconnect_attempts_.load(std::memory_order_relaxed);
+  if (this->reconnect_pending_.load(std::memory_order_relaxed) &&
+      !this->pending_disconnect_.load(std::memory_order_relaxed) &&
+      websocket_client_cleaned_up &&
+      (millis() - this->last_reconnect_attempt_.load(std::memory_order_relaxed)) > RECONNECT_DELAY_MS &&
+      reconnect_attempts < MAX_RECONNECT_ATTEMPTS) {
+    this->reconnect_pending_.store(false, std::memory_order_relaxed);
+    this->last_reconnect_attempt_.store(millis(), std::memory_order_relaxed);
+    reconnect_attempts = this->reconnect_attempts_.fetch_add(1, std::memory_order_relaxed) + 1;
+    ESP_LOGW(TAG, "Attempting to reconnect (attempt %u/%u)...", reconnect_attempts, MAX_RECONNECT_ATTEMPTS);
     this->connect_websocket_();
   }
 
@@ -151,7 +172,7 @@ void VoiceAssistantWebSocket::loop() {
   // no speaker audio. last_speaker_audio_time_ is seeded in start() so
   // a session that opens but never produces audio still times out
   // (previously a 0 value made this branch a no-op).
-  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  if (this->state_.load(std::memory_order_relaxed) == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     uint32_t last_audio = this->last_speaker_audio_time_.load(std::memory_order_relaxed);
     if (last_audio != 0) {
       uint32_t elapsed = millis() - last_audio;
@@ -175,14 +196,94 @@ void VoiceAssistantWebSocket::dump_config() {
   ESP_LOGCONFIG(TAG, "  Max Queue Size: %zu chunks", MAX_QUEUE_SIZE);
 }
 
+bool VoiceAssistantWebSocket::is_connected() const {
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->websocket_client_mutex_, pdMS_TO_TICKS(10));
+  if (!lock.acquired()) {
+    return false;
+  }
+#endif
+  return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_);
+}
+
+bool VoiceAssistantWebSocket::speaker_is_running_() const {
+  if (this->speaker_ == nullptr) {
+    return false;
+  }
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->speaker_mutex_, pdMS_TO_TICKS(10));
+  if (!lock.acquired()) {
+    return false;
+  }
+#endif
+  return this->speaker_->is_running();
+}
+
+bool VoiceAssistantWebSocket::speaker_is_stopped_() const {
+  if (this->speaker_ == nullptr) {
+    return true;
+  }
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->speaker_mutex_, pdMS_TO_TICKS(10));
+  if (!lock.acquired()) {
+    return false;
+  }
+#endif
+  return this->speaker_->is_stopped();
+}
+
+void VoiceAssistantWebSocket::start_speaker_if_stopped_() {
+  if (this->speaker_ == nullptr) {
+    return;
+  }
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->speaker_mutex_);
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire speaker_mutex_, start skipped");
+    return;
+  }
+#endif
+  if (this->speaker_->is_stopped()) {
+    this->speaker_->start();
+  }
+}
+
+void VoiceAssistantWebSocket::stop_speaker_() {
+  if (this->speaker_ == nullptr) {
+    return;
+  }
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->speaker_mutex_);
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire speaker_mutex_, stop skipped");
+    return;
+  }
+#endif
+  this->speaker_->stop();
+}
+
+size_t VoiceAssistantWebSocket::play_speaker_(const uint8_t *data, size_t len) {
+  if (this->speaker_ == nullptr) {
+    return 0;
+  }
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->speaker_mutex_, pdMS_TO_TICKS(100));
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire speaker_mutex_, dropping %zu bytes", len);
+    return 0;
+  }
+#endif
+  return this->speaker_->play(data, len);
+}
+
 void VoiceAssistantWebSocket::start() {
-  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  if (this->state_.load(std::memory_order_relaxed) == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     ESP_LOGW(TAG, "Already running");
     return;
   }
   
   ESP_LOGI(TAG, "Starting Voice Assistant WebSocket...");
-  this->state_ = VOICE_ASSISTANT_WEBSOCKET_STARTING;
+  this->state_.store(VOICE_ASSISTANT_WEBSOCKET_STARTING, std::memory_order_relaxed);
 
   // Seed last_speaker_audio_time_ to "now" rather than 0. The auto-stop
   // check in loop() ignores the 0 sentinel, so a session that never
@@ -191,7 +292,7 @@ void VoiceAssistantWebSocket::start() {
   this->last_speaker_audio_time_.store(millis(), std::memory_order_relaxed);
 
   // Reset explicit disconnect flag for new session
-  this->explicit_disconnect_ = false;
+  this->explicit_disconnect_.store(false, std::memory_order_relaxed);
 
   // Reset interrupt time
   this->interrupt_time_.store(0, std::memory_order_relaxed);
@@ -208,6 +309,12 @@ void VoiceAssistantWebSocket::start() {
   
   // Start speaker - the resampler will handle format conversion
   if (this->speaker_ != nullptr) {
+#ifdef USE_ESP_IDF
+    MutexLock lock(this->speaker_mutex_);
+    if (!lock.acquired()) {
+      ESP_LOGW(TAG, "Could not acquire speaker_mutex_, speaker start skipped");
+    } else {
+#endif
     // IMPORTANT: Set audio stream info BEFORE starting the speaker!
     // The resampler uses audio_stream_info_ to determine the input sample rate.
     // OpenAI sends 24kHz, 16-bit, mono audio - let the resampler convert to 48kHz
@@ -219,31 +326,36 @@ void VoiceAssistantWebSocket::start() {
     if (this->speaker_->is_stopped()) {
       this->speaker_->start();
     }
+#ifdef USE_ESP_IDF
+    }
+#endif
   }
   
   if (this->state_callback_) {
-    this->state_callback_(this->state_);
+    this->state_callback_(this->state_.load(std::memory_order_relaxed));
   }
   
   this->connect_websocket_();
 }
 
 void VoiceAssistantWebSocket::stop() {
-  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
+  if (this->state_.load(std::memory_order_relaxed) == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
     return;
   }
   
   ESP_LOGI(TAG, "Stopping Voice Assistant WebSocket...");
-  this->state_ = VOICE_ASSISTANT_WEBSOCKET_STOPPING;
+  this->state_.store(VOICE_ASSISTANT_WEBSOCKET_STOPPING, std::memory_order_relaxed);
   
   // Don't stop microphone - micro_wake_word needs it to continue running
   // The microphone can be shared between multiple components in ESPHome
   // micro_wake_word will continue to work even when voice_assistant_websocket is stopped
   ESP_LOGD(TAG, "Keeping microphone running for micro_wake_word");
   // Stop speaker if it's running
-  if (this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
+  this->stop_speaker_();
+
+  // A local stop/auto-stop is intentional. Suppress reconnect when the
+  // websocket task emits the resulting DISCONNECTED event.
+  this->explicit_disconnect_.store(true, std::memory_order_relaxed);
 
   // Clear audio queue under the mutex (websocket task may still be
   // pushing for another millisecond or two while stop() runs).
@@ -257,36 +369,49 @@ void VoiceAssistantWebSocket::stop() {
 #endif
   
   if (this->state_callback_) {
-    this->state_callback_(this->state_);
+    this->state_callback_(this->state_.load(std::memory_order_relaxed));
   }
   
   // IMPORTANT: Cannot call disconnect_websocket_() from websocket task/event handler
   // Set flag to disconnect in loop() instead (which runs in main task)
-  this->pending_disconnect_ = true;
+  this->pending_disconnect_.store(true, std::memory_order_relaxed);
   
   // Note: Rest of cleanup (buffers, state, triggers) will be done in loop() after disconnect
 }
 
 void VoiceAssistantWebSocket::request_start() {
-  this->pending_start_ = true;
+  this->pending_start_.store(true, std::memory_order_relaxed);
 }
 
 void VoiceAssistantWebSocket::connect_websocket_() {
+#ifdef USE_ESP_IDF
+  {
+    MutexLock lock(this->websocket_client_mutex_);
+    if (!lock.acquired()) {
+      ESP_LOGW(TAG, "Could not acquire websocket_client_mutex_, connect skipped");
+      return;
+    }
+    if (this->websocket_client_ != nullptr) {
+#else
   if (this->websocket_client_ != nullptr) {
+#endif
     ESP_LOGW(TAG, "WebSocket client already exists, cleaning up...");
     // Use pending_disconnect_ instead of direct call to avoid blocking
     // Set reconnect_pending_ so we retry after disconnect completes
-    this->pending_disconnect_ = true;
-    this->reconnect_pending_ = true;
-    this->last_reconnect_attempt_ = millis();  // Reset timer so we retry after disconnect
+    this->pending_disconnect_.store(true, std::memory_order_relaxed);
+    this->reconnect_pending_.store(true, std::memory_order_relaxed);
+    this->last_reconnect_attempt_.store(millis(), std::memory_order_relaxed);  // Reset timer so we retry after disconnect
     return;  // Exit early, will retry connection after disconnect completes in loop()
   }
+#ifdef USE_ESP_IDF
+  }
+#endif
   
   if (this->server_url_.empty()) {
     ESP_LOGE(TAG, "Server URL not set!");
-    this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
+    this->state_.store(VOICE_ASSISTANT_WEBSOCKET_ERROR, std::memory_order_relaxed);
     if (this->state_callback_) {
-      this->state_callback_(this->state_);
+      this->state_callback_(this->state_.load(std::memory_order_relaxed));
     }
     return;
   }
@@ -305,36 +430,71 @@ void VoiceAssistantWebSocket::connect_websocket_() {
   websocket_cfg.ping_interval_sec = 20;  // Send ping every 20 seconds (matches server)
   websocket_cfg.pingpong_timeout_sec = 10;  // 10 second timeout for pong (matches server)
   
-  this->websocket_client_ = esp_websocket_client_init(&websocket_cfg);
-  if (this->websocket_client_ == nullptr) {
+  esp_websocket_client_handle_t client = esp_websocket_client_init(&websocket_cfg);
+  if (client == nullptr) {
     ESP_LOGE(TAG, "Failed to initialize WebSocket client");
-    this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
+    this->state_.store(VOICE_ASSISTANT_WEBSOCKET_ERROR, std::memory_order_relaxed);
     if (this->state_callback_) {
-      this->state_callback_(this->state_);
+      this->state_callback_(this->state_.load(std::memory_order_relaxed));
     }
     return;
   }
   
   // Register event handler
-  esp_websocket_register_events(this->websocket_client_, 
+  esp_websocket_register_events(client,
                                  (esp_websocket_event_id_t) WEBSOCKET_EVENT_ANY,
                                  websocket_event_handler_,
                                  this);
+
+#ifdef USE_ESP_IDF
+  {
+    MutexLock lock(this->websocket_client_mutex_);
+    if (!lock.acquired()) {
+      ESP_LOGW(TAG, "Could not store websocket client, destroying");
+      esp_websocket_client_destroy(client);
+      this->state_.store(VOICE_ASSISTANT_WEBSOCKET_ERROR, std::memory_order_relaxed);
+      if (this->state_callback_) {
+        this->state_callback_(this->state_.load(std::memory_order_relaxed));
+      }
+      return;
+    }
+    this->websocket_client_ = client;
+  }
+#else
+  this->websocket_client_ = client;
+#endif
   
   // Start connection
-  esp_err_t err = esp_websocket_client_start(this->websocket_client_);
+  esp_err_t err = esp_websocket_client_start(client);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to start WebSocket client: %s", esp_err_to_name(err));
-    esp_websocket_client_destroy(this->websocket_client_);
-    this->websocket_client_ = nullptr;
-    this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
-    if (this->state_callback_) {
-      this->state_callback_(this->state_);
+#ifdef USE_ESP_IDF
+    {
+      MutexLock lock(this->websocket_client_mutex_);
+      if (lock.acquired() && this->websocket_client_ == client) {
+        this->websocket_client_ = nullptr;
+      }
     }
+#else
+    this->websocket_client_ = nullptr;
+#endif
+    esp_websocket_client_destroy(client);
+    this->state_.store(VOICE_ASSISTANT_WEBSOCKET_ERROR, std::memory_order_relaxed);
+    if (this->state_callback_) {
+      this->state_callback_(this->state_.load(std::memory_order_relaxed));
+    }
+    return;
   }
 }
 
 void VoiceAssistantWebSocket::disconnect_websocket_() {
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->websocket_client_mutex_);
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire websocket_client_mutex_, disconnect skipped");
+    return;
+  }
+#endif
   if (this->websocket_client_ != nullptr) {
     ESP_LOGI(TAG, "Disconnecting WebSocket...");
     
@@ -363,10 +523,13 @@ void VoiceAssistantWebSocket::disconnect_websocket_() {
 }
 
 void VoiceAssistantWebSocket::send_audio_chunk_(const uint8_t *data, size_t len) {
-  // Snapshot the client pointer so an interleaved
-  // disconnect_websocket_() can't null it between our check and the
-  // send call. Worst case we send to a stale handle and ESP-IDF
-  // returns an error — much better than a NULL deref.
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->websocket_client_mutex_, pdMS_TO_TICKS(AUDIO_SEND_TIMEOUT_MS));
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire websocket_client_mutex_, dropping %zu byte chunk", len);
+    return;
+  }
+#endif
   esp_websocket_client_handle_t client = this->websocket_client_;
   if (client == nullptr || !esp_websocket_client_is_connected(client)) {
     return;
@@ -390,7 +553,7 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
     return;
   }
 
-  if (this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  if (this->state_.load(std::memory_order_relaxed) != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     ESP_LOGD(TAG, "Skipping audio playback - voice assistant not in running state");
     return;
   }
@@ -413,9 +576,9 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
 
   // OpenAI sends 24kHz, 16-bit, mono PCM. The resampler (set up in
   // start()) handles 24kHz -> 48kHz + mono->stereo for I2S.
-  if (this->speaker_->is_stopped()) {
+  if (this->speaker_is_stopped_()) {
     ESP_LOGD(TAG, "Speaker is stopped, starting it");
-    this->speaker_->start();
+    this->start_speaker_if_stopped_();
   }
 
   // Drain queued audio first. Pull one chunk at a time from the front
@@ -436,7 +599,7 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
       chunk = std::move(this->audio_queue_.front());
       this->audio_queue_.pop_front();
     }
-    size_t written = this->speaker_->play(chunk.data(), chunk.size());
+    size_t written = this->play_speaker_(chunk.data(), chunk.size());
     if (written == chunk.size()) {
       ESP_LOGD(TAG, "Drained queued audio chunk (%zu bytes)", chunk.size());
       continue;  // Try to drain the next chunk too
@@ -466,7 +629,7 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
   this->last_speaker_audio_time_.store(millis(), std::memory_order_relaxed);
 
   // Send the new audio chunk.
-  size_t bytes_written = this->speaker_->play(data, len);
+  size_t bytes_written = this->play_speaker_(data, len);
 
   if (bytes_written == len) {
     return;  // Fully consumed; nothing to queue.
@@ -503,7 +666,8 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
   // Only process if connected and running
-  if (!this->is_connected() || this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  if (!this->is_connected() ||
+      this->state_.load(std::memory_order_relaxed) != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     return;
   }
   
@@ -586,9 +750,7 @@ bool VoiceAssistantWebSocket::is_bot_speaking() const {
 }
 
 void VoiceAssistantWebSocket::stop_speaker_after_interrupt_() {
-  if (this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
+  this->stop_speaker_();
   // Clear audio queue under the mutex (other tasks may be pushing).
 #ifdef USE_ESP_IDF
   {
@@ -608,6 +770,13 @@ void VoiceAssistantWebSocket::stop_speaker_after_interrupt_() {
 }
 
 void VoiceAssistantWebSocket::interrupt() {
+#ifdef USE_ESP_IDF
+  MutexLock lock(this->websocket_client_mutex_, pdMS_TO_TICKS(AUDIO_SEND_TIMEOUT_MS));
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Cannot send interrupt - websocket client busy");
+    return;
+  }
+#endif
   esp_websocket_client_handle_t client = this->websocket_client_;
   if (client == nullptr || !esp_websocket_client_is_connected(client)) {
     ESP_LOGW(TAG, "Cannot send interrupt - not connected");
@@ -654,13 +823,13 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
 
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
-      this->state_ = VOICE_ASSISTANT_WEBSOCKET_RUNNING;
-      this->reconnect_attempts_ = 0;
-      this->reconnect_pending_ = false;
+      this->state_.store(VOICE_ASSISTANT_WEBSOCKET_RUNNING, std::memory_order_relaxed);
+      this->reconnect_attempts_.store(0, std::memory_order_relaxed);
+      this->reconnect_pending_.store(false, std::memory_order_relaxed);
       this->last_audio_send_ = millis();
 
       if (this->state_callback_) {
-        this->state_callback_(this->state_);
+        this->state_callback_(this->state_.load(std::memory_order_relaxed));
       }
 
       // Trigger connected automation
@@ -669,10 +838,10 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
 
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "WebSocket disconnected");
-      this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
+      this->state_.store(VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED, std::memory_order_relaxed);
 
       if (this->state_callback_) {
-        this->state_callback_(this->state_);
+        this->state_callback_(this->state_.load(std::memory_order_relaxed));
       }
       this->disconnected_trigger_.trigger();
 
@@ -683,14 +852,14 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       // reconnect_pending_ but the client handle stayed alive, so
       // loop's reconnect check (`websocket_client_ == nullptr`) never
       // tripped and reconnects never happened.
-      if (!this->explicit_disconnect_) {
-        this->pending_disconnect_ = true;
-        this->reconnect_pending_ = true;
-        this->last_reconnect_attempt_ = millis();
+      if (!this->explicit_disconnect_.load(std::memory_order_relaxed)) {
+        this->pending_disconnect_.store(true, std::memory_order_relaxed);
+        this->reconnect_pending_.store(true, std::memory_order_relaxed);
+        this->last_reconnect_attempt_.store(millis(), std::memory_order_relaxed);
       } else {
         ESP_LOGI(TAG, "Explicit disconnect received, staying in idle mode (no reconnection)");
-        this->explicit_disconnect_ = false;
-        this->pending_disconnect_ = true;  // still need cleanup
+        this->explicit_disconnect_.store(false, std::memory_order_relaxed);
+        this->pending_disconnect_.store(true, std::memory_order_relaxed);  // still need cleanup
       }
       break;
 
@@ -714,7 +883,7 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");
           // Mark that we received an explicit disconnect to prevent reconnection
-          this->explicit_disconnect_ = true;
+          this->explicit_disconnect_.store(true, std::memory_order_relaxed);
           // Stop the voice assistant (will go to idle mode)
           this->stop();
         }
@@ -774,10 +943,10 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       } else {
         ESP_LOGE(TAG, "WebSocket error (no event data available)");
       }
-      this->state_ = VOICE_ASSISTANT_WEBSOCKET_ERROR;
+      this->state_.store(VOICE_ASSISTANT_WEBSOCKET_ERROR, std::memory_order_relaxed);
       
       if (this->state_callback_) {
-        this->state_callback_(this->state_);
+        this->state_callback_(this->state_.load(std::memory_order_relaxed));
       }
       
       // Trigger error automation
@@ -788,9 +957,9 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       // queue a reconnect. Without `pending_disconnect_` set,
       // `websocket_client_` stays non-null and the reconnect check
       // in loop() never trips.
-      this->pending_disconnect_ = true;
-      this->reconnect_pending_ = true;
-      this->last_reconnect_attempt_ = millis();
+      this->pending_disconnect_.store(true, std::memory_order_relaxed);
+      this->reconnect_pending_.store(true, std::memory_order_relaxed);
+      this->last_reconnect_attempt_.store(millis(), std::memory_order_relaxed);
       break;
       
     default:

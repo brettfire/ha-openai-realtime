@@ -1,14 +1,13 @@
 """WebSocket handler for managing WebSocket connections and pipelines."""
-import asyncio
+import inspect
 import logging
 import uuid
-from typing import Optional, Callable, Awaitable, Dict
+from typing import Optional, Callable, Awaitable
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
-from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, StartFrame, EndFrame
@@ -107,7 +106,7 @@ class WebSocketHandler:
     def build_pipeline(
         self,
         transport: WebsocketServerTransport,
-        openai_service: OpenAIRealtimeLLMService,
+        session_processor: FrameProcessor,
         client_id: str,
         activity_callback: Optional[Callable[[], None]] = None
     ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
@@ -116,7 +115,7 @@ class WebSocketHandler:
         
         Args:
             transport: The WebSocket transport instance
-            openai_service: The OpenAI service instance
+            session_processor: Processor that owns the active OpenAI session
             client_id: Unique identifier for the client device
             activity_callback: Optional callback for session activity tracking
             
@@ -125,10 +124,10 @@ class WebSocketHandler:
         """
         logger.info(f"🔗 Building pipeline for client: {client_id}")
         
-        if openai_service is None:
-            raise RuntimeError("OpenAI service must be created before building pipeline")
+        if session_processor is None:
+            raise RuntimeError("Session processor must be created before building pipeline")
         
-        logger.info(f"🔗 Building pipeline with WebSocket transport and OpenAI service: {type(openai_service).__name__}")
+        logger.info(f"🔗 Building pipeline with WebSocket transport and session processor: {type(session_processor).__name__}")
         
         # Create activity trackers
         input_activity_tracker = SessionActivityTracker(
@@ -137,13 +136,6 @@ class WebSocketHandler:
         output_activity_tracker = SessionActivityTracker(
             activity_callback=activity_callback or (lambda: None)
         )
-        
-        # Create context aggregator with cached context if available
-        context_aggregator = None
-        context_initializer = None
-        if self.session_manager:
-            context_aggregator = self.session_manager.create_context_aggregator(client_id)
-            context_initializer = self.session_manager.create_context_initializer(client_id, context_aggregator)
         
         # Build pipeline components
         pipeline_components = [
@@ -156,16 +148,7 @@ class WebSocketHandler:
         if input_recorder:
             pipeline_components.append(input_recorder)
         
-        # Continue with rest of pipeline
-        if context_aggregator:
-            pipeline_components.extend([
-                context_aggregator.user(),
-                openai_service,
-                context_aggregator.assistant(),
-            ])
-        else:
-            pipeline_components.append(openai_service)
-        
+        pipeline_components.append(session_processor)
         pipeline_components.append(output_activity_tracker)
         
         # Add output audio recorder to capture ONLY OutputAudioRawFrame
@@ -174,10 +157,6 @@ class WebSocketHandler:
             pipeline_components.append(output_recorder)
         
         pipeline_components.append(transport.output())
-        
-        # Add context initializer if we have cached messages
-        if context_initializer:
-            pipeline_components.append(context_initializer)
         
         pipeline = Pipeline(pipeline_components)
         logger.info("✅ Pipeline created for WebSocket connection")
@@ -221,7 +200,7 @@ class WebSocketHandler:
         self,
         transport: WebsocketServerTransport,
         on_client_connected_callback: Callable[[str], Awaitable[None]],
-        on_client_disconnected_callback: Optional[Callable[[str], None]] = None,
+        on_client_disconnected_callback: Optional[Callable[[str], Awaitable[None] | None]] = None,
     ):
         """
         Setup WebSocket event handlers.
@@ -245,7 +224,9 @@ class WebSocketHandler:
                 client_id = self.extract_client_id(websocket)
                 if client_id:
                     logger.info(f"🔌 Client {client_id} disconnected")
-                    on_client_disconnected_callback(client_id)
+                    result = on_client_disconnected_callback(client_id)
+                    if inspect.isawaitable(result):
+                        await result
         
         # NOTE: pipecat 0.0.97's WebsocketServerTransport only emits
         # on_client_connected / on_client_disconnected / on_session_timeout

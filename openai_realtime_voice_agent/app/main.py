@@ -13,7 +13,8 @@ from pipecat.transports.websocket.server import WebsocketServerTransport
 from app.mcp_service import HomeAssistantMCPService
 from app.disconnect_tool import get_disconnect_tool_definition, create_disconnect_tool_handler
 from app.audio_recording_service import AudioRecordingService
-from app.session_manager import SessionManager, _shutdown_service_safely
+from app.realtime_session_router import RealtimeSessionRouter
+from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
 
 # Configure logging
@@ -41,6 +42,7 @@ class Application:
         self.websocket_handler: Optional[WebSocketHandler] = None
         self.websocket_transport: Optional[WebsocketServerTransport] = None
         self.openai_service: Optional[OpenAIRealtimeLLMService] = None
+        self.session_router: Optional[RealtimeSessionRouter] = None
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
@@ -124,14 +126,13 @@ class Application:
             transport: The WebSocket transport instance
             client_id: Unique identifier for the client device
         """
-        # Ensure OpenAI service exists
-        if self.openai_service is None:
-            raise RuntimeError("OpenAI service must be created before building pipeline")
+        if self.session_router is None:
+            raise RuntimeError("Session router must be created before building pipeline")
         
         # Use WebSocket handler to build pipeline
         self.pipeline, self.runner, self.current_task = self.websocket_handler.build_pipeline(
             transport=transport,
-            openai_service=self.openai_service,
+            session_processor=self.session_router,
             client_id=client_id,
             activity_callback=self._update_session_activity
         )
@@ -159,24 +160,11 @@ class Application:
             else:
                 logger.info("🆕 Creating new OpenAI Session...")
             
-            # Capture the previous service so we can schedule its shutdown
-            # in ALL cases below — `cleanup_before_new_session` only handles
-            # services tracked in session_manager.current_services (services
-            # created with a client_id). The "initial" service created by
-            # run() before any client connects has no client_id, isn't in
-            # that dict, and would otherwise leak its OpenAI WebSocket
-            # until OpenAI's 60-min session-expiry timer kills it.
-            previous_service = self.openai_service
-
             # Cache context from old service before creating new one
-            if client_id and previous_service is not None:
+            if client_id:
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
                     logger.debug(f"Cached context from previous session for client {client_id}")
-                    # cleanup_before_new_session already scheduled shutdown
-                    # for the tracked service; clear local handle so we don't
-                    # double-shutdown below.
-                    previous_service = None
                 except Exception as e:
                     logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
             
@@ -278,14 +266,6 @@ class Application:
             
             logger.info(f"🔧 Creating session with {len(all_tools)} tools: {[tool.get('name', 'unknown') for tool in all_tools]}")
 
-            # If we still have a previous service that session_manager didn't
-            # handle (the initial run()-created one, or any anonymous path),
-            # schedule its shutdown so its OpenAI WebSocket gets closed
-            # instead of idling until OpenAI's 60-min session-expiry.
-            if previous_service is not None:
-                logger.info("🧹 Shutting down untracked previous OpenAI service")
-                asyncio.create_task(_shutdown_service_safely(previous_service))
-
             # Create new service instance
             self.openai_service = OpenAIRealtimeLLMService(
                 api_key=self.openai_api_key,
@@ -318,25 +298,29 @@ class Application:
     async def run(self) -> None:
         """Run the application."""
         await self.initialize()
+
+        self.session_router = RealtimeSessionRouter(session_manager=self.session_manager)
         
-        # Create initial OpenAI service (will be replaced per connection)
-        await self._ensure_openai_service()
-        
-        # Build pipeline - based on pipecat-examples, one pipeline handles all connections
-        # The transport manages multiple connections internally
+        # Build one outer pipeline to keep the websocket server alive. The
+        # session_router installs a fresh OpenAIRealtimeLLMService for each
+        # client connection.
         self._build_pipeline_for_transport(self.websocket_transport, "server")
         
         # Setup WebSocket event handlers
         async def on_client_connected(client_id: str):
             """Handle new client connection."""
-            await self._ensure_openai_service(client_id=client_id)
+            if self.session_router and self.session_router.active_service:
+                await self.session_router.end_session(cache_context=True)
+            service = await self._ensure_openai_service(client_id=client_id)
+            await self.session_router.start_session(client_id, service)
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
         
-        def on_client_disconnected(client_id: str):
+        async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
-            if self.session_manager:
-                self.session_manager.handle_client_disconnect(client_id, self.openai_service)
+            if self.session_router:
+                await self.session_router.end_session(cache_context=True)
+            self.openai_service = None
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
         

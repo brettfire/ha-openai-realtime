@@ -7,6 +7,7 @@ from pipecat.frames.frames import Frame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from app.main import Application
+from app.realtime_session_router import RealtimeSessionRouter
 from app.websocket_handler import WebSocketHandler
 
 
@@ -47,14 +48,13 @@ class PipelineContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_pipeline_does_not_start_runner(self):
         handler = WebSocketHandler()
 
-        with patch("app.websocket_handler.asyncio.create_task") as create_task:
-            handler.build_pipeline(
-                transport=FakeTransport(),
-                openai_service=PassthroughProcessor(),
-                client_id="client-1",
-            )
+        handler.build_pipeline(
+            transport=FakeTransport(),
+            session_processor=PassthroughProcessor(),
+            client_id="client-1",
+        )
 
-        create_task.assert_not_called()
+        self.assertNotIn("create_task", inspect.getsource(WebSocketHandler.build_pipeline))
 
     async def test_build_pipeline_uses_recording_service_when_present(self):
         recording_service = FakeRecordingService()
@@ -62,7 +62,7 @@ class PipelineContractTests(unittest.IsolatedAsyncioTestCase):
 
         handler.build_pipeline(
             transport=FakeTransport(),
-            openai_service=PassthroughProcessor(),
+            session_processor=PassthroughProcessor(),
             client_id="client-1",
         )
 
@@ -92,16 +92,22 @@ class ApplicationInitializationContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(app.websocket_handler.audio_recording_service, recording_service)
 
 
-class KnownContractGapTests(unittest.TestCase):
-    @unittest.expectedFailure
-    def test_client_connect_service_is_inserted_into_the_pipeline(self):
-        """Known gap: client connect creates a new service outside the pipeline."""
-
+class ApplicationSessionContractTests(unittest.TestCase):
+    def test_client_connect_installs_created_service_into_session_router(self):
         source = inspect.getsource(Application.run)
         connected_handler = source.split("async def on_client_connected", 1)[1]
-        connected_handler = connected_handler.split("def on_client_disconnected", 1)[0]
+        connected_handler = connected_handler.split("async def on_client_disconnected", 1)[0]
 
-        self.assertIn("_build_pipeline_for_transport", connected_handler)
+        self.assertIn("service = await self._ensure_openai_service", connected_handler)
+        self.assertIn("await self.session_router.start_session(client_id, service)", connected_handler)
+
+
+class RealtimeSessionRouterContractTests(unittest.TestCase):
+    def test_router_drops_non_system_frames_without_active_session(self):
+        source = inspect.getsource(RealtimeSessionRouter.process_frame)
+
+        self.assertIn("self._active is None", source)
+        self.assertIn("StartFrame, EndFrame, CancelFrame, SystemFrame", source)
 
 
 if __name__ == "__main__":
