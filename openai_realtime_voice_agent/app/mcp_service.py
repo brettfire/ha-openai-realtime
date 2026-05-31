@@ -51,7 +51,14 @@ class HomeAssistantMCPService:
         self.mcp_client: Optional[MCPClient] = None
 
     async def initialize(self) -> MCPClient:
-        """Initialize and return the MCP client."""
+        """Initialize and return the MCP client.
+
+        As of pipecat 1.0, ``MCPClient`` requires explicit lifecycle
+        management — either ``async with MCPClient(...)`` or paired
+        ``start()`` / ``close()`` calls. We use the explicit form since
+        the addon's main loop is structured around init / run /
+        cleanup, not a single context-manager scope.
+        """
         try:
             logger.info(f"🔗 Initializing Home Assistant MCP Client at {self.url}")
 
@@ -63,8 +70,9 @@ class HomeAssistantMCPService:
                 }
             )
 
-            # Create MCP client
+            # Create + start MCP client
             self.mcp_client = MCPClient(server_params=server_params)
+            await self.mcp_client.start()
 
             logger.info("✅ Home Assistant MCP Client initialized")
             return self.mcp_client
@@ -76,6 +84,23 @@ class HomeAssistantMCPService:
     def get_client(self) -> Optional[MCPClient]:
         """Get the MCP client instance."""
         return self.mcp_client
+
+    async def cleanup(self) -> None:
+        """Close the long-lived MCPClient connection.
+
+        Called from Application.cleanup() on shutdown. Pipecat 1.0+
+        leaks an HTTP/streamable connection per session-lifetime if
+        close() is never called.
+        """
+        if self.mcp_client is None:
+            return
+        try:
+            await self.mcp_client.close()
+            logger.info("🧹 Closed MCP client")
+        except Exception as e:
+            logger.warning(f"⚠️ Error closing MCP client: {e}")
+        finally:
+            self.mcp_client = None
 
     async def fetch_assist_prompt_and_snapshot(
         self,

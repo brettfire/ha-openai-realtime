@@ -7,7 +7,7 @@ from typing import Optional
 import dotenv
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerTransport
 from app.mcp_service import HomeAssistantMCPService
@@ -46,7 +46,7 @@ class Application:
         self.mcp_service: Optional[HomeAssistantMCPService] = None
         self.audio_recording_service: Optional[AudioRecordingService] = None
         self.session_manager: Optional[SessionManager] = None
-        self.current_task: Optional[PipelineTask] = None
+        self.current_task: Optional[PipelineWorker] = None
         self._pipeline_lock: Optional[asyncio.Lock] = None
         
     async def initialize(self) -> None:
@@ -363,7 +363,13 @@ class Application:
         
         if self.audio_recording_service:
             self.audio_recording_service.cleanup()
-        
+
+        if self.mcp_service:
+            try:
+                await self.mcp_service.cleanup()
+            except Exception as e:
+                logger.warning(f"⚠️ Error cleaning up MCP service: {e}")
+
         logger.info("✅ Application cleanup complete")
 
 

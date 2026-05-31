@@ -6,7 +6,7 @@ from typing import Optional, Callable, Awaitable
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineTask
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.transports.websocket.server import WebsocketServerTransport, WebsocketServerParams
 
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
@@ -74,7 +74,7 @@ class WebSocketHandler:
         self.transport: Optional[WebsocketServerTransport] = None
         self.pipeline: Optional[Pipeline] = None
         self.runner: Optional[PipelineRunner] = None
-        self.current_task: Optional[PipelineTask] = None
+        self.current_task: Optional[PipelineWorker] = None
     
     def create_transport(self) -> WebsocketServerTransport:
         """
@@ -109,7 +109,7 @@ class WebSocketHandler:
         session_processor: FrameProcessor,
         client_id: str,
         activity_callback: Optional[Callable[[], None]] = None
-    ) -> tuple[Pipeline, PipelineRunner, PipelineTask]:
+    ) -> tuple[Pipeline, PipelineRunner, PipelineWorker]:
         """
         Build pipeline for a WebSocket transport connection.
         
@@ -120,7 +120,7 @@ class WebSocketHandler:
             activity_callback: Optional callback for session activity tracking
             
         Returns:
-            Tuple of (Pipeline, PipelineRunner, PipelineTask)
+            Tuple of (Pipeline, PipelineRunner, PipelineWorker)
         """
         logger.info(f"🔗 Building pipeline for client: {client_id}")
         
@@ -169,7 +169,7 @@ class WebSocketHandler:
         # always stay ready for connections. The caller owns runner.run(task);
         # starting it here as well creates a duplicate pipeline lifecycle.
         runner = PipelineRunner()
-        task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
+        task = PipelineWorker(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
         logger.info("✅ Pipeline initialized successfully")
         
         return pipeline, runner, task

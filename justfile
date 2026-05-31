@@ -97,7 +97,7 @@ addon-build:
     cd openai_realtime_voice_agent && \
         {{docker}} buildx build \
             --platform linux/arm64 \
-            --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest \
+            --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base-debian:trixie \
             --build-arg BUILD_ARCH=aarch64 \
             -t local-test:dev .
 
