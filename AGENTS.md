@@ -227,11 +227,14 @@ must be in download mode (hold BOOT, plug in USB).
 
 `voice_pe_config.yaml` is the base config and also the default
 flashable for the original `ha-voice-openai` device. For additional
-speakers, create a tiny per-device wrapper next to the base named
-`voice_pe_<device_name>.yaml`:
+speakers, create a tiny per-device wrapper. Two flavors depending on
+where the wrapper will be compiled:
+
+**Flavor A — local `!include` (for compiling from a clone of this
+repo, e.g. your Mac with `just flash device=...`):**
 
 ```yaml
-# voice_pe_voicepe2.yaml
+# voice_pe_voicepe2.yaml — lives next to voice_pe_config.yaml
 packages:
   base: !include voice_pe_config.yaml
 
@@ -243,35 +246,62 @@ api:
     key: !secret api_encryption_key_voicepe2
 ```
 
-Then add the per-device key to `secrets.yaml`:
+**Flavor B — git package (for pasting into HA's ESPHome Device
+Builder addon UI or any standalone ESPHome instance):**
+
+```yaml
+# Paste straight into HA ESPHome dashboard. Self-contained.
+packages:
+  base:
+    url: https://github.com/brettfire/ha-openai-realtime
+    ref: main
+    files: [home-assistant-voice-pe/voice_pe_config.yaml]
+
+substitutions:
+  device_name: voicepe2
+
+api:
+  encryption:
+    key: !secret api_encryption_key_voicepe2
+```
+
+Both produce identical firmware. The git form pulls the base + the
+custom `voice_assistant_websocket` component from github at compile
+time. ESPHome resolves the base's `external_components: type: local,
+path: esphome/components` relative to the cached package location,
+where the components exist in the fetched repo tree — so the
+local-source custom component "just works" inside a git-fetched base.
+Verified locally.
+
+For either flavor, add the per-device API key to `secrets.yaml`:
 
 ```yaml
 api_encryption_key_voicepe2: "<unique base64 32 bytes>"
 ```
 
-And flash with the justfile:
-
+And flash:
 ```sh
-just flash device=voicepe2
-just logs device=voicepe2
-just validate device=voicepe2
+just flash device=voicepe2          # local flavor, on your Mac
+# OR: paste flavor B into HA ESPHome dashboard, hit Install.
 ```
 
 Why this pattern instead of substitution-into-secret-name:
 ESPHome **doesn't expand substitutions inside `!secret` tags** —
-they're literal lookups. So `!secret api_encryption_key_${var}`
-looks up the literal key name `api_encryption_key_${var}` and fails.
-The wrapper pattern works around it cleanly using ESPHome's
-`packages:` deep-merge: the wrapper inherits everything from the
-base, then overrides only the substitutions and the api key.
+they're literal lookups. `!secret api_encryption_key_${var}` looks up
+the literal name `api_encryption_key_${var}` and fails. The
+`packages:` deep-merge gives us per-device override of just the
+`api.encryption.key` field while inheriting everything else.
 
-Wrappers MUST live in the same directory as the base YAML, not in a
-subdirectory like `devices/` — the base's `external_components:
-type: local, path: esphome/components` is resolved relative to the
-compiled YAML's directory, so a wrapper in `devices/` would look for
-`devices/esphome/components/` which doesn't exist.
+Local-flavor wrappers MUST live in the same directory as the base
+YAML, not in a subdirectory like `devices/` — the base's
+`external_components: type: local, path: esphome/components` is
+resolved relative to the **compiled YAML's directory**, so a wrapper
+in `devices/` would look for `devices/esphome/components/` which
+doesn't exist. Git-flavor wrappers don't have this constraint
+because the path is relative to the cached package, not the wrapper.
 
-`voice_pe_example.yaml` is a template — copy it, rename, edit.
+`voice_pe_example.yaml` is a template that shows both flavors with
+one commented out — copy it, rename, edit, choose flavor.
 
 ### After a `.cpp` / `.h` change in the custom component
 

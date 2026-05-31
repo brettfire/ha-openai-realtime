@@ -1,22 +1,42 @@
 # Per-device wrapper TEMPLATE for adding additional Voice PE speakers.
 #
-# Copy this to `voice_pe_<your-device-name>.yaml` (same directory),
-# replace `voice_pe_example` everywhere below with your device name,
-# add a matching per-device key to secrets.yaml:
+# Two flavors below — pick the one that matches where you're going to
+# compile this YAML. They produce identical firmware:
 #
-#   api_encryption_key_<your-device-name>: "<base64-32-bytes>"
+#   A) Local !include — for compiling from a clone of this repo
+#      (your Mac with `just flash device=<name>` or `poetry run
+#      esphome run voice_pe_<name>.yaml`). Picks up uncommitted
+#      changes to voice_pe_config.yaml or the custom C++ component
+#      immediately, no push/pull needed.
 #
-# Then flash with:
-#   just flash device=<your-device-name>
-# or:
-#   poetry run esphome run voice_pe_<your-device-name>.yaml
+#   B) Git package — for pasting into HA's ESPHome Device Builder
+#      addon UI, or any other ESPHome instance that doesn't have
+#      this repo cloned. ESPHome fetches the base + custom component
+#      from github at compile time. Self-contained one-file paste.
+#      For dev iteration you'd need to push first.
 #
-# The default speaker (ha-voice-openai) doesn't need a wrapper —
-# `just flash` / `poetry run esphome run voice_pe_config.yaml` still
-# flashes that one using the original `api_encryption_key` secret.
+# Steps:
+#   1. Copy this file to voice_pe_<your-device-name>.yaml (same dir
+#      if local, or paste straight into HA's ESPHome dashboard).
+#   2. Replace `voice_pe_example` everywhere below with your device
+#      name (lowercase, no spaces).
+#   3. Pick ONE of the `packages:` blocks below — delete the other.
+#   4. Add the per-device API key to secrets.yaml:
+#        api_encryption_key_<your-device-name>: "<base64 32 bytes>"
+#      (generate with: openssl rand -base64 32)
+#   5. Flash with `just flash device=<your-device-name>` (local) or
+#      Install from the HA ESPHome dashboard (git).
 
+# --- Flavor A: local include (delete if using git) ---
 packages:
   base: !include voice_pe_config.yaml
+
+# --- Flavor B: git package (delete if using local include) ---
+# packages:
+#   base:
+#     url: https://github.com/brettfire/ha-openai-realtime
+#     ref: main
+#     files: [home-assistant-voice-pe/voice_pe_config.yaml]
 
 substitutions:
   device_name: voice_pe_example
