@@ -55,3 +55,9 @@ substitutions:
 api:
   encryption:
     key: !secret api_encryption_key_voice_pe_example
+  # If `<device_name>.local` doesn't resolve from your ESPHome
+  # dashboard / Mac (multi-AP setups, VLANs without mDNS forwarding,
+  # container networking weirdness), uncomment + set the device's IP
+  # so ESPHome skips the mDNS lookup. Pair with a DHCP reservation
+  # so the IP doesn't drift.
+  # use_address: 192.168.1.45

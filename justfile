@@ -33,6 +33,12 @@ device := "config"
 # Serial port for USB flashing. Override per recipe call.
 port := "/dev/cu.usbmodem*"
 
+# IP/hostname for OTA flashing when mDNS resolution of `<name>.local`
+# fails (guest WiFi, VLANs, multi-AP setups without mDNS forwarding).
+# Empty = let ESPHome default to mDNS lookup. Override per recipe:
+#   just flash device=voicepe2 address=192.168.1.45
+address := ""
+
 # ---------------------------------------------------------------------------
 # ESPHome firmware (Voice PE satellite)
 # ---------------------------------------------------------------------------
@@ -45,17 +51,23 @@ validate:
 compile:
     cd home-assistant-voice-pe && poetry run esphome compile voice_pe_{{device}}.yaml
 
+# Pass address=... if mDNS lookup of `<device>.local` fails on your
+# network (`just flash device=voicepe2 address=192.168.1.45`).
 # Compile, OTA-flash the device, and stream logs (default dev loop).
 flash:
-    cd home-assistant-voice-pe && poetry run esphome run voice_pe_{{device}}.yaml
+    cd home-assistant-voice-pe && poetry run esphome run \
+        {{ if address == "" { "" } else { "--device " + address } }} \
+        voice_pe_{{device}}.yaml
 
 # USB-flash via serial. Override port: `just port=/dev/cu.usbserial-1234 flash-usb`.
 flash-usb:
     cd home-assistant-voice-pe && poetry run esphome run --device {{port}} voice_pe_{{device}}.yaml
 
-# Stream logs from the already-running device.
+# Stream logs from the already-running device. Pass address=... if mDNS fails.
 logs:
-    cd home-assistant-voice-pe && poetry run esphome logs voice_pe_{{device}}.yaml
+    cd home-assistant-voice-pe && poetry run esphome logs \
+        {{ if address == "" { "" } else { "--device " + address } }} \
+        voice_pe_{{device}}.yaml
 
 # Wipe esphome build cache for the selected device (forces a fresh compile).
 clean:
@@ -63,12 +75,15 @@ clean:
 
 # Default ref is the version we pin in external_components; override with
 # `just upstream_ref=main diff-upstream` to compare against the latest.
-# Diff our voice_pe_config.yaml against upstream HA Voice PE YAML.
+# The base file is the apples-to-apples comparison after our split —
+# the 33-line voice_pe_config.yaml wrapper just supplies per-device
+# identity + encryption key.
+# Diff our voice_pe_base.yaml against upstream HA Voice PE YAML.
 diff-upstream:
-    @echo "Diffing voice_pe_config.yaml vs {{upstream_repo}}@{{upstream_ref}}/{{upstream_file}}"
+    @echo "Diffing voice_pe_base.yaml vs {{upstream_repo}}@{{upstream_ref}}/{{upstream_file}}"
     @echo
     @curl -fsSL "https://raw.githubusercontent.com/{{upstream_repo}}/{{upstream_ref}}/{{upstream_file}}" \
-        | git diff --no-index --color=always -- - home-assistant-voice-pe/voice_pe_config.yaml \
+        | git diff --no-index --color=always -- - home-assistant-voice-pe/voice_pe_base.yaml \
         || true
 
 # ---------------------------------------------------------------------------
