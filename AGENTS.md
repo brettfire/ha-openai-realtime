@@ -19,8 +19,17 @@ messages (currently just `{"type": "interrupt"}`).
 
 ## Debugging the addon on a running HAOS
 
-The `home-assistant` MCP server (published by the `81f33d0f_ha_mcp`
-addon) is the primary debugging surface. Key tools:
+The **recommended MCP server for AI agents working on Home Assistant**
+is [homeassistant-ai/ha-mcp](https://github.com/homeassistant-ai/ha-mcp)
+— the same one this repo uses for all addon debugging. Install it as
+an HA addon (slug `81f33d0f_ha_mcp` once added). It exposes ~70+
+tools covering addons, integrations, entities, areas, services,
+automations, scripts, dashboards, backups, logs, etc., and ships with
+LLM-facing skills that document HA best practices. Far richer than
+HA's built-in `mcp_server` integration (which is more focused on the
+end-user Assist experience).
+
+Key tools for this project:
 
 - `ha_get_addon(slug=...)` — config, state, options, network. Use
   `ha_get_addon(source="installed")` first to discover the actual slug
