@@ -9,11 +9,13 @@
 #include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #endif
+#include <atomic>
+#include <deque>
 #include <string>
 #include <vector>
-#include <queue>
 
 namespace esphome {
 namespace voice_assistant_websocket {
@@ -105,13 +107,16 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> error_trigger_{};
   Trigger<> stopped_trigger_{};
   
-  // Audio buffers
-  std::vector<uint8_t> input_buffer_;
-  std::vector<uint8_t> output_buffer_;
-  
-  // Queue for audio data when speaker buffer is full
-  // Reduced size to prevent memory exhaustion
-  std::queue<std::vector<uint8_t>> audio_queue_;
+  // Queue for audio data when the speaker buffer is full.
+  // Touched from the ESPHome main loop AND the websocket task — every
+  // access must hold audio_queue_mutex_. std::deque (not std::queue)
+  // so we can push_front the remainder of a partial write to preserve
+  // PCM order. Pop pattern: move-from-front THEN pop, never use a
+  // reference to .front() after pop (that's UB).
+  std::deque<std::vector<uint8_t>> audio_queue_;
+#ifdef USE_ESP_IDF
+  SemaphoreHandle_t audio_queue_mutex_{nullptr};
+#endif
   static const size_t MAX_QUEUE_SIZE = 10;  // Max 10 chunks (~40KB) to prevent memory overflow
   static const size_t MIN_FREE_HEAP_BYTES = 15000;  // Minimum free heap required before queuing audio
   
@@ -125,15 +130,18 @@ class VoiceAssistantWebSocket : public Component {
   static const uint32_t BYTES_PER_SAMPLE = 2;          // 16-bit = 2 bytes
   static const uint32_t INPUT_BUFFER_SIZE = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * AUDIO_SEND_INTERVAL_MS) / 1000;
   
-  // Auto-stop tracking
-  uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
+  // Auto-stop tracking. Written by the websocket task (when speaker
+  // audio arrives) and the main task (initial seed in start()); read
+  // by the main task (loop auto-stop check + is_bot_speaking) and the
+  // microphone task (mic-mute decision). std::atomic so we don't rely
+  // on 32-bit alignment + lack of compiler caching for correctness.
+  std::atomic<uint32_t> last_speaker_audio_time_{0};
   static const uint32_t AUTO_STOP_INACTIVITY_MS = 20000;  // Stop after 20 seconds of speaker inactivity
-  
-  // Audio conversion buffers
-  std::vector<int16_t> mono_buffer_;  // For stereo to mono conversion (input)
-  std::vector<int16_t> resampled_buffer_;  // For 16kHz -> 24kHz resampling (1.5x upsampling)
-  std::vector<uint8_t> output_stereo_buffer_;  // For output processing (24kHz mono -> 48kHz stereo, 16-bit)
-  
+
+  // Audio conversion buffers (microphone task only — no sync needed).
+  std::vector<int16_t> mono_buffer_;       // 32-bit stereo -> 16-bit mono (input)
+  std::vector<int16_t> resampled_buffer_;  // 16kHz -> 24kHz resampling (1.5x upsampling)
+
   bool pending_start_{false};
   bool pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
   bool reconnect_pending_{false};
@@ -142,12 +150,16 @@ class VoiceAssistantWebSocket : public Component {
   static const uint32_t MAX_RECONNECT_ATTEMPTS = 5;
   static const uint32_t RECONNECT_DELAY_MS = 5000;
   uint32_t last_reconnect_attempt_{0};
-  uint32_t interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)
-  static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 500;  // Ignore audio for 500ms after interrupt
 
+  // Cross-task scalars — same reasoning as last_speaker_audio_time_.
+  std::atomic<uint32_t> interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)
+  static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 500;  // Ignore audio for 500ms after interrupt
+  static const uint32_t AUDIO_SEND_TIMEOUT_MS = 100;       // Bounded send_bin timeout; chunk dropped on miss
   // Default to the safer wake-word-only mode; YAML can override at
   // startup (e.g. via a restored template select) and at runtime.
-  BargeInMode barge_in_mode_{BARGE_IN_WAKE_WORD};
+  // Written by the action handler (main task), read by the mic
+  // callback task.
+  std::atomic<BargeInMode> barge_in_mode_{BARGE_IN_WAKE_WORD};
 };
 
 // Action classes for automations (defined outside the main class)

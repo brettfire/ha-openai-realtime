@@ -5,7 +5,6 @@
 #include "esphome/core/hal.h"
 #include <cstring>
 #include <algorithm>
-#include <queue>
 
 #ifdef USE_ESP_IDF
 #include "esp_system.h"
@@ -16,15 +15,40 @@ static const char *TAG = "voice_assistant_websocket";
 namespace esphome {
 namespace voice_assistant_websocket {
 
+#ifdef USE_ESP_IDF
+// Tiny RAII helper so every audio_queue_ touch goes through the mutex.
+class AudioQueueLock {
+ public:
+  AudioQueueLock(SemaphoreHandle_t mutex, TickType_t timeout = portMAX_DELAY) : mutex_(mutex) {
+    locked_ = (mutex_ != nullptr) && (xSemaphoreTake(mutex_, timeout) == pdTRUE);
+  }
+  ~AudioQueueLock() {
+    if (locked_) {
+      xSemaphoreGive(mutex_);
+    }
+  }
+  bool acquired() const { return locked_; }
+  // Non-copyable / non-movable.
+  AudioQueueLock(const AudioQueueLock &) = delete;
+  AudioQueueLock &operator=(const AudioQueueLock &) = delete;
+ private:
+  SemaphoreHandle_t mutex_;
+  bool locked_;
+};
+#endif
+
 void VoiceAssistantWebSocket::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Voice Assistant WebSocket...");
-  this->input_buffer_.reserve(INPUT_BUFFER_SIZE);
-  this->output_buffer_.reserve(4096);  // Reserve space for output buffer
-  this->mono_buffer_.reserve(INPUT_BUFFER_SIZE / 2);  // Reserve for mono conversion (input)
-  this->resampled_buffer_.reserve(INPUT_BUFFER_SIZE * 3 / 2); // 1.5x upsampling for 16kHz -> 24kHz
-  this->output_stereo_buffer_.reserve(4096 * 2);  // Reserve for output processing (24kHz mono -> 48kHz stereo)
+  this->mono_buffer_.reserve(INPUT_BUFFER_SIZE / 2);   // 32-bit stereo -> 16-bit mono
+  this->resampled_buffer_.reserve(INPUT_BUFFER_SIZE * 3 / 2);  // 1.5x upsampling for 16kHz -> 24kHz
+#ifdef USE_ESP_IDF
+  this->audio_queue_mutex_ = xSemaphoreCreateMutex();
+  if (this->audio_queue_mutex_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to create audio_queue_mutex_");
+  }
+#endif
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
-  
+
   // Register microphone data callback
   if (this->microphone_ != nullptr) {
     this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
@@ -34,60 +58,84 @@ void VoiceAssistantWebSocket::setup() {
 }
 
 void VoiceAssistantWebSocket::loop() {
-  // Handle pending disconnect (must be done in main task, not websocket task)
+  // Handle pending disconnect (must be done in main task, not websocket task).
+  // After cleanup we keep reconnect_pending_ alone — if a network event set
+  // it, the reconnect path below will fire on the next loop iteration.
+  // (The old code reset it to false here, which was the reconnect-deadlock
+  // bug — events would set reconnect_pending_, then our own disconnect path
+  // would immediately clear it, and no reconnect would ever happen.)
   if (this->pending_disconnect_) {
     this->pending_disconnect_ = false;
     this->disconnect_websocket_();
-    // After disconnect, continue with stop() cleanup
-    // Clear buffers
-    this->input_buffer_.clear();
-    this->output_buffer_.clear();
-    
+
     this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
-    this->reconnect_attempts_ = 0;
-    this->reconnect_pending_ = false;
-    
+    if (!this->reconnect_pending_) {
+      // Pure stop (no reconnect intent) — reset attempt counter.
+      this->reconnect_attempts_ = 0;
+    }
+
     if (this->state_callback_) {
       this->state_callback_(this->state_);
     }
-    
-    // Trigger stopped automation
-    this->stopped_trigger_.trigger();
-    
-    ESP_LOGI(TAG, "Voice Assistant WebSocket stopped");
+
+    // Only treat as a "stopped" event if there's no reconnect coming.
+    // Otherwise consumers (LEDs etc.) would flash IDLE in between.
+    if (!this->reconnect_pending_) {
+      this->stopped_trigger_.trigger();
+      ESP_LOGI(TAG, "Voice Assistant WebSocket stopped");
+    } else {
+      ESP_LOGI(TAG, "Voice Assistant WebSocket cleaned up, reconnect queued");
+    }
     return;  // Skip other loop operations after disconnect
   }
-  
-  // Try to process queued audio if speaker is running
-  if (this->speaker_ != nullptr && this->speaker_->is_running() && !this->audio_queue_.empty()) {
-    const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
-    size_t queued_written = this->speaker_->play(queued_data.data(), queued_data.size());
-    
-    if (queued_written == queued_data.size()) {
-      // Successfully sent queued data
-      this->audio_queue_.pop();
-      ESP_LOGD(TAG, "Sent queued audio chunk from loop (%zu bytes)", queued_data.size());
-    } else if (queued_written > 0) {
-      // Partially sent - remove sent portion and keep remainder
-      if (queued_written < queued_data.size()) {
-        std::vector<uint8_t> remainder(queued_data.begin() + queued_written, queued_data.end());
-        this->audio_queue_.pop();
-        this->audio_queue_.push(remainder);
-      } else {
-        this->audio_queue_.pop();
+
+  // Drain queued audio if the speaker is running. The actual play()
+  // call happens OUTSIDE the mutex to keep the critical section short.
+#ifdef USE_ESP_IDF
+  if (this->speaker_ != nullptr && this->speaker_->is_running()) {
+    std::vector<uint8_t> chunk;
+    {
+      AudioQueueLock lock(this->audio_queue_mutex_);
+      if (lock.acquired() && !this->audio_queue_.empty()) {
+        chunk = std::move(this->audio_queue_.front());
+        this->audio_queue_.pop_front();
       }
     }
-    // If queued_written == 0, buffer is still full, try again next loop
+    if (!chunk.empty()) {
+      size_t written = this->speaker_->play(chunk.data(), chunk.size());
+      if (written == chunk.size()) {
+        ESP_LOGD(TAG, "Sent queued audio chunk from loop (%zu bytes)", chunk.size());
+      } else if (written > 0 && written < chunk.size()) {
+        // Push unsent remainder to the FRONT to preserve PCM order —
+        // newer chunks (added by the websocket task) must NOT play
+        // before this remainder. std::deque::push_front does what
+        // std::queue::push couldn't.
+        std::vector<uint8_t> remainder(chunk.begin() + written, chunk.end());
+        AudioQueueLock lock(this->audio_queue_mutex_);
+        if (lock.acquired()) {
+          this->audio_queue_.push_front(std::move(remainder));
+        }
+        ESP_LOGD(TAG, "Partial play (%zu/%zu), remainder re-queued at front", written, chunk.size());
+      } else if (written == 0) {
+        // Speaker buffer is full again. Put the whole chunk back at
+        // the front so we re-attempt on the next loop iteration.
+        AudioQueueLock lock(this->audio_queue_mutex_);
+        if (lock.acquired()) {
+          this->audio_queue_.push_front(std::move(chunk));
+        }
+      }
+    }
   }
-  
+#endif
+
   // Handle pending start request
   if (this->pending_start_ && this->state_ == VOICE_ASSISTANT_WEBSOCKET_IDLE) {
     this->pending_start_ = false;
     this->start();
   }
-  
+
   // Handle reconnection (only if not pending disconnect and websocket client is cleaned up)
-  if (this->reconnect_pending_ && 
+  if (this->reconnect_pending_ &&
       !this->pending_disconnect_ &&
       this->websocket_client_ == nullptr &&
       (millis() - this->last_reconnect_attempt_) > RECONNECT_DELAY_MS &&
@@ -98,34 +146,22 @@ void VoiceAssistantWebSocket::loop() {
     ESP_LOGW(TAG, "Attempting to reconnect (attempt %u/%u)...", this->reconnect_attempts_, MAX_RECONNECT_ATTEMPTS);
     this->connect_websocket_();
   }
-  
-  // Auto-stop: Check if we should stop after inactivity
-  // Stop if: speaker hasn't spoken for 5 seconds
-  // Note: We only check speaker audio, not microphone audio, because:
-  // - Microphone always sends audio (background noise, silence, etc.)
-  // - OpenAI's server_vad handles voice activity detection
-  // - If user speaks, OpenAI will generate new audio, which resets the timer
+
+  // Auto-stop: stop the session after AUTO_STOP_INACTIVITY_MS (20s) of
+  // no speaker audio. last_speaker_audio_time_ is seeded in start() so
+  // a session that opens but never produces audio still times out
+  // (previously a 0 value made this branch a no-op).
   if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
-    uint32_t current_time = millis();
-    uint32_t time_since_speaker_audio = current_time - this->last_speaker_audio_time_;
-    
-    // Only check if we've received at least one audio chunk (to avoid stopping immediately)
-    if (this->last_speaker_audio_time_ > 0) {
-      // Stop if speaker hasn't spoken for 5 seconds
-      // If user speaks during this time, OpenAI will generate new audio, resetting the timer
-      if (time_since_speaker_audio > AUTO_STOP_INACTIVITY_MS) {
-        ESP_LOGI(TAG, "Auto-stopping: Speaker inactive for %u ms (threshold: %u ms)", 
-                 time_since_speaker_audio, AUTO_STOP_INACTIVITY_MS);
+    uint32_t last_audio = this->last_speaker_audio_time_.load(std::memory_order_relaxed);
+    if (last_audio != 0) {
+      uint32_t elapsed = millis() - last_audio;
+      if (elapsed > AUTO_STOP_INACTIVITY_MS) {
+        ESP_LOGI(TAG, "Auto-stopping: %u ms with no speaker audio (threshold %u ms)",
+                 elapsed, AUTO_STOP_INACTIVITY_MS);
         this->stop();
       }
     }
   }
-  
-  // Audio input is handled via callback (on_microphone_data_)
-  // No need to poll here
-  
-  // Audio output is handled directly in process_received_audio_()
-  // No queue processing needed here
 }
 
 void VoiceAssistantWebSocket::dump_config() {
@@ -147,15 +183,18 @@ void VoiceAssistantWebSocket::start() {
   
   ESP_LOGI(TAG, "Starting Voice Assistant WebSocket...");
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_STARTING;
-  
-  // Reset auto-stop tracking
-  this->last_speaker_audio_time_ = 0;
-  
+
+  // Seed last_speaker_audio_time_ to "now" rather than 0. The auto-stop
+  // check in loop() ignores the 0 sentinel, so a session that never
+  // produces speaker audio would otherwise run forever — fixes the
+  // cold-start-with-no-response edge case caught in code review.
+  this->last_speaker_audio_time_.store(millis(), std::memory_order_relaxed);
+
   // Reset explicit disconnect flag for new session
   this->explicit_disconnect_ = false;
-  
+
   // Reset interrupt time
-  this->interrupt_time_ = 0;
+  this->interrupt_time_.store(0, std::memory_order_relaxed);
   
   // Start microphone first (if not already running)
   // Note: micro_wake_word also uses this microphone, so it might already be running
@@ -205,11 +244,17 @@ void VoiceAssistantWebSocket::stop() {
   if (this->speaker_ != nullptr) {
     this->speaker_->stop();
   }
-  
-  // Clear audio queue
-  while (!this->audio_queue_.empty()) {
-    this->audio_queue_.pop();
+
+  // Clear audio queue under the mutex (websocket task may still be
+  // pushing for another millisecond or two while stop() runs).
+#ifdef USE_ESP_IDF
+  {
+    AudioQueueLock lock(this->audio_queue_mutex_);
+    if (lock.acquired()) {
+      this->audio_queue_.clear();
+    }
   }
+#endif
   
   if (this->state_callback_) {
     this->state_callback_(this->state_);
@@ -318,142 +363,142 @@ void VoiceAssistantWebSocket::disconnect_websocket_() {
 }
 
 void VoiceAssistantWebSocket::send_audio_chunk_(const uint8_t *data, size_t len) {
-  if (!this->is_connected() || this->websocket_client_ == nullptr) {
+  // Snapshot the client pointer so an interleaved
+  // disconnect_websocket_() can't null it between our check and the
+  // send call. Worst case we send to a stale handle and ESP-IDF
+  // returns an error — much better than a NULL deref.
+  esp_websocket_client_handle_t client = this->websocket_client_;
+  if (client == nullptr || !esp_websocket_client_is_connected(client)) {
     return;
   }
-  
-  // Send binary data
-  int sent = esp_websocket_client_send_bin(this->websocket_client_, 
-                                            (const char *) data, 
-                                            len, 
-                                            portMAX_DELAY);
+  // Bounded timeout (was portMAX_DELAY). The mic callback path
+  // calls this for every audio chunk; a network stall used to block
+  // the callback indefinitely, starving the wake-word detector and
+  // tripping the task watchdog. AUDIO_SEND_TIMEOUT_MS = 100ms is
+  // long enough to absorb normal jitter but short enough that we
+  // drop a chunk rather than hang.
+  int sent = esp_websocket_client_send_bin(client, (const char *) data, len,
+                                            pdMS_TO_TICKS(AUDIO_SEND_TIMEOUT_MS));
   if (sent < 0) {
-    ESP_LOGW(TAG, "Failed to send audio chunk");
+    ESP_LOGW(TAG, "send_bin timed out or failed (dropping %zu byte chunk)", len);
   }
 }
 
 void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_t len) {
-  // Use speaker directly (media_player uses this speaker internally via announcement_pipeline)
-  // The media_player is configured in YAML but we access the speaker directly for PCM audio streaming
   if (this->speaker_ == nullptr) {
     ESP_LOGW(TAG, "Speaker is null, cannot play audio");
     return;
   }
-  
-  // Don't try to play audio if speaker is not ready (still initializing)
-  // The speaker will retry automatically, so we just skip audio for now
+
   if (this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     ESP_LOGD(TAG, "Skipping audio playback - voice assistant not in running state");
     return;
   }
-  
-  // Ignore audio for a short period after interrupt to allow server to process it
-  if (this->interrupt_time_ > 0) {
-    uint32_t time_since_interrupt = millis() - this->interrupt_time_;
-    if (time_since_interrupt < INTERRUPT_IGNORE_AUDIO_MS) {
-      ESP_LOGD(TAG, "Ignoring audio after interrupt (%u ms remaining)", 
-               INTERRUPT_IGNORE_AUDIO_MS - time_since_interrupt);
-      return;  // Drop audio packets for a short time after interrupt
-    } else {
-      // Reset interrupt time after ignore period
-      this->interrupt_time_ = 0;
-      ESP_LOGI(TAG, "Resuming audio processing after interrupt");
+
+  // Ignore audio for a short period after an interrupt to give the
+  // server time to stop sending. Atomic load + compare-exchange so a
+  // concurrent interrupt() can't tear the value.
+  uint32_t interrupt_t = this->interrupt_time_.load(std::memory_order_relaxed);
+  if (interrupt_t > 0) {
+    uint32_t elapsed = millis() - interrupt_t;
+    if (elapsed < INTERRUPT_IGNORE_AUDIO_MS) {
+      ESP_LOGD(TAG, "Ignoring audio after interrupt (%u ms remaining)",
+               INTERRUPT_IGNORE_AUDIO_MS - elapsed);
+      return;
     }
+    // Window expired — clear the sentinel if it's still ours.
+    this->interrupt_time_.compare_exchange_strong(interrupt_t, 0u, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "Resuming audio processing after interrupt");
   }
-  
-  // OpenAI sends 24kHz, 16-bit, mono PCM
-  // The resampler is configured for 48kHz output and will automatically convert 24kHz -> 48kHz
-  // We set audio_stream_info to 24kHz in start(), so the resampler knows the input sample rate
-  // ESPHome will then convert 16-bit to 32-bit and mono to stereo for I2S
-  
-  // Ensure speaker is running before sending audio
-  // For streaming audio, we want continuous playback
+
+  // OpenAI sends 24kHz, 16-bit, mono PCM. The resampler (set up in
+  // start()) handles 24kHz -> 48kHz + mono->stereo for I2S.
   if (this->speaker_->is_stopped()) {
     ESP_LOGD(TAG, "Speaker is stopped, starting it");
     this->speaker_->start();
   }
-  
-  // Try to process queued audio first (if any)
-  while (!this->audio_queue_.empty()) {
-    const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
-    size_t queued_written = this->speaker_->play(queued_data.data(), queued_data.size());
-    
-    if (queued_written == queued_data.size()) {
-      // Successfully sent queued data
-      this->audio_queue_.pop();
-      ESP_LOGD(TAG, "Sent queued audio chunk (%zu bytes)", queued_data.size());
-    } else if (queued_written > 0) {
-      // Partially sent - remove sent portion and keep remainder
-      if (queued_written < queued_data.size()) {
-        // Check heap before creating remainder vector
+
+  // Drain queued audio first. Pull one chunk at a time from the front
+  // under the mutex; play OUTSIDE the mutex to keep the critical
+  // section short. CRITICAL: this used to dereference a reference to
+  // front() AFTER pop(), which is undefined behavior (the deque slot
+  // was freed). Move-out then pop fixes it. Partial remainders go
+  // back to the FRONT (not back) so PCM order is preserved against
+  // newer chunks the next process_received_audio_ call might add.
 #ifdef USE_ESP_IDF
-        size_t free_heap = esp_get_free_heap_size();
-        if (free_heap < MIN_FREE_HEAP_BYTES) {
-          ESP_LOGW(TAG, "Low heap (%zu bytes), dropping remainder instead of queuing", free_heap);
-          this->audio_queue_.pop();
-          break;  // Drop remainder to preserve memory
-        }
-#endif
-        std::vector<uint8_t> remainder(queued_data.begin() + queued_written, queued_data.end());
-        this->audio_queue_.pop();
-        this->audio_queue_.push(remainder);
-      } else {
-        this->audio_queue_.pop();
+  while (true) {
+    std::vector<uint8_t> chunk;
+    {
+      AudioQueueLock lock(this->audio_queue_mutex_);
+      if (!lock.acquired() || this->audio_queue_.empty()) {
+        break;
       }
-      ESP_LOGD(TAG, "Partially sent queued audio chunk (%zu/%zu bytes)", queued_written, queued_data.size());
-      break;  // Buffer is getting full, stop processing queue
-    } else {
-      // Buffer still full, can't send queued data yet
-      break;
+      chunk = std::move(this->audio_queue_.front());
+      this->audio_queue_.pop_front();
     }
+    size_t written = this->speaker_->play(chunk.data(), chunk.size());
+    if (written == chunk.size()) {
+      ESP_LOGD(TAG, "Drained queued audio chunk (%zu bytes)", chunk.size());
+      continue;  // Try to drain the next chunk too
+    }
+    // Partial or zero write — speaker buffer is filling up. Put the
+    // remainder (or the whole chunk) back at the FRONT and stop
+    // draining; we'll resume on the next call.
+    if (written > 0 && written < chunk.size()) {
+      std::vector<uint8_t> remainder(chunk.begin() + written, chunk.end());
+      AudioQueueLock lock(this->audio_queue_mutex_);
+      if (lock.acquired()) {
+        this->audio_queue_.push_front(std::move(remainder));
+      }
+      ESP_LOGD(TAG, "Partial play (%zu/%zu), remainder re-queued at front", written, chunk.size());
+    } else if (written == 0) {
+      AudioQueueLock lock(this->audio_queue_mutex_);
+      if (lock.acquired()) {
+        this->audio_queue_.push_front(std::move(chunk));
+      }
+    }
+    break;
   }
-  
-  // Update last speaker audio time for auto-stop tracking and bot speaking detection
-  this->last_speaker_audio_time_ = millis();
-  
-  // Send new audio data
+#endif
+
+  // Update last_speaker_audio_time_ for auto-stop tracking and
+  // is_bot_speaking(). Atomic — read from main + mic tasks.
+  this->last_speaker_audio_time_.store(millis(), std::memory_order_relaxed);
+
+  // Send the new audio chunk.
   size_t bytes_written = this->speaker_->play(data, len);
-  
-  if (bytes_written == 0 && len > 0) {
-    // Speaker buffer is full - queue the data for later
-    // Check heap and queue size before attempting to queue
-#ifdef USE_ESP_IDF
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_FREE_HEAP_BYTES) {
-      ESP_LOGW(TAG, "Low heap (%zu bytes), dropping audio chunk (%zu bytes)", free_heap, len);
-      return;  // Drop audio to preserve memory
-    }
-#endif
-    if (this->audio_queue_.size() >= MAX_QUEUE_SIZE) {
-      ESP_LOGW(TAG, "Audio queue at max size (%zu/%zu), dropping audio to prevent memory overflow", 
-               this->audio_queue_.size(), MAX_QUEUE_SIZE);
-      return;  // Drop audio instead of causing memory overflow
-    }
-    // Try to create vector - if allocation fails, it will crash, but we've checked heap above
-    std::vector<uint8_t> queued_chunk(data, data + len);
-    this->audio_queue_.push(queued_chunk);
-    ESP_LOGD(TAG, "Speaker buffer full, queued %zu bytes (queue size: %zu/%zu)", 
-             len, this->audio_queue_.size(), MAX_QUEUE_SIZE);
-  } else if (bytes_written < len) {
-    // Partially written - queue the remainder
-#ifdef USE_ESP_IDF
-    size_t free_heap = esp_get_free_heap_size();
-    if (free_heap < MIN_FREE_HEAP_BYTES) {
-      ESP_LOGW(TAG, "Low heap (%zu bytes), dropping remainder (%zu bytes)", free_heap, len - bytes_written);
-      return;  // Drop remainder to preserve memory
-    }
-#endif
-    if (this->audio_queue_.size() >= MAX_QUEUE_SIZE) {
-      ESP_LOGW(TAG, "Audio queue at max size (%zu/%zu), dropping remainder to prevent memory overflow", 
-               this->audio_queue_.size(), MAX_QUEUE_SIZE);
-      return;  // Drop remainder instead of causing memory overflow
-    }
-    // Try to create vector - if allocation fails, it will crash, but we've checked heap above
-    std::vector<uint8_t> remainder(data + bytes_written, data + len);
-    this->audio_queue_.push(remainder);
-    ESP_LOGD(TAG, "Partially wrote %zu/%zu bytes, queued remainder (queue size: %zu/%zu)", 
-             bytes_written, len, this->audio_queue_.size(), MAX_QUEUE_SIZE);
+
+  if (bytes_written == len) {
+    return;  // Fully consumed; nothing to queue.
   }
+
+  // Partial or zero write — queue what's left for the loop / next
+  // call to drain. Build the remainder OUTSIDE the mutex so the
+  // critical section is just the push_back.
+  size_t remainder_offset = bytes_written;
+#ifdef USE_ESP_IDF
+  size_t free_heap = esp_get_free_heap_size();
+  if (free_heap < MIN_FREE_HEAP_BYTES) {
+    ESP_LOGW(TAG, "Low heap (%zu bytes), dropping %zu byte remainder", free_heap, len - remainder_offset);
+    return;
+  }
+#endif
+  std::vector<uint8_t> remainder(data + remainder_offset, data + len);
+#ifdef USE_ESP_IDF
+  AudioQueueLock lock(this->audio_queue_mutex_);
+  if (!lock.acquired()) {
+    ESP_LOGW(TAG, "Could not acquire audio_queue_mutex_, dropping remainder");
+    return;
+  }
+  if (this->audio_queue_.size() >= MAX_QUEUE_SIZE) {
+    ESP_LOGW(TAG, "Audio queue full (%zu/%zu), dropping remainder",
+             this->audio_queue_.size(), MAX_QUEUE_SIZE);
+    return;
+  }
+  this->audio_queue_.push_back(std::move(remainder));
+  ESP_LOGD(TAG, "Queued %zu byte remainder (queue size: %zu/%zu)",
+           len - remainder_offset, this->audio_queue_.size(), MAX_QUEUE_SIZE);
+#endif
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
@@ -466,7 +511,10 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   // playback echo (or normal room noise) can't trigger server VAD. In
   // full-duplex mode, keep streaming and rely on the Voice PE's
   // hardware AEC + server VAD on the OpenAI Realtime API for barge-in.
-  if (this->barge_in_mode_ == BARGE_IN_WAKE_WORD && this->is_bot_speaking()) {
+  // Atomic load: the action handler that flips the mode runs on the
+  // main task, the read here runs on the microphone callback task.
+  if (this->barge_in_mode_.load(std::memory_order_relaxed) == BARGE_IN_WAKE_WORD &&
+      this->is_bot_speaking()) {
     return;
   }
   
@@ -519,51 +567,67 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
 }
 
 void VoiceAssistantWebSocket::set_barge_in_mode(BargeInMode mode) {
-  if (this->barge_in_mode_ != mode) {
-    this->barge_in_mode_ = mode;
+  BargeInMode previous = this->barge_in_mode_.exchange(mode, std::memory_order_relaxed);
+  if (previous != mode) {
     ESP_LOGI(TAG, "Barge-in mode set to %s",
              mode == BARGE_IN_FULL_DUPLEX ? "full_duplex" : "wake_word");
   }
 }
 
 bool VoiceAssistantWebSocket::is_bot_speaking() const {
-  // Bot is considered speaking if we received audio within the last 500ms
-  if (this->last_speaker_audio_time_ == 0) {
-    return false;  // No audio received yet
+  // Bot is considered speaking if we received audio within the last 500ms.
+  // Atomic load — written by the websocket task, read here from the
+  // main task and the microphone task.
+  uint32_t last = this->last_speaker_audio_time_.load(std::memory_order_relaxed);
+  if (last == 0) {
+    return false;
   }
-  uint32_t time_since_last_audio = millis() - this->last_speaker_audio_time_;
-  return time_since_last_audio < 500;  // 500ms threshold
+  return (millis() - last) < 500;
 }
 
 void VoiceAssistantWebSocket::interrupt() {
-  if (!this->is_connected() || this->websocket_client_ == nullptr) {
+  esp_websocket_client_handle_t client = this->websocket_client_;
+  if (client == nullptr || !esp_websocket_client_is_connected(client)) {
     ESP_LOGW(TAG, "Cannot send interrupt - not connected");
     return;
   }
-  
+
   ESP_LOGI(TAG, "Sending interrupt message to server");
-  
-  // Send interrupt message as JSON text frame
+
+  // JSON control frame — addon's raw_audio_serializer recognises this
+  // substring and pushes a pipecat InterruptionFrame upstream. The
+  // string is intentionally simple (not a structured JSON build) and
+  // the substring match on the server is intentional: both ends are
+  // ours and we never change the wire format.
   const char *interrupt_msg = "{\"type\":\"interrupt\"}";
-  int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg, strlen(interrupt_msg), portMAX_DELAY);
-  
+  int sent = esp_websocket_client_send_text(client, interrupt_msg, strlen(interrupt_msg),
+                                             pdMS_TO_TICKS(AUDIO_SEND_TIMEOUT_MS));
+
   if (sent < 0) {
-    ESP_LOGW(TAG, "Failed to send interrupt message");
-  } else {
-    ESP_LOGI(TAG, "Interrupt message sent successfully");
-    // Stop speaker immediately after sending interrupt
-    if (this->speaker_ != nullptr) {
-      this->speaker_->stop();
-    }
-    // Clear audio queue to free memory and prevent overflow
-    while (!this->audio_queue_.empty()) {
-      this->audio_queue_.pop();
-    }
-    // Set interrupt time to ignore incoming audio for a short period
-    // This gives the server time to process the interrupt and stop sending audio
-    this->interrupt_time_ = millis();
-    ESP_LOGI(TAG, "Cleared audio queue and ignoring incoming audio for %u ms", INTERRUPT_IGNORE_AUDIO_MS);
+    ESP_LOGW(TAG, "Failed to send interrupt message (network stall?)");
+    return;
   }
+
+  ESP_LOGI(TAG, "Interrupt message sent successfully");
+  if (this->speaker_ != nullptr) {
+    this->speaker_->stop();
+  }
+  // Clear audio queue under the mutex (other tasks may be pushing).
+#ifdef USE_ESP_IDF
+  {
+    AudioQueueLock lock(this->audio_queue_mutex_);
+    if (lock.acquired()) {
+      this->audio_queue_.clear();
+    }
+  }
+#endif
+  // Atomic set — read concurrently by process_received_audio_ on the
+  // websocket task. millis() == 0 is the "no interrupt" sentinel, so
+  // if we happen to land there, bump by 1ms.
+  uint32_t now = millis();
+  if (now == 0) now = 1;
+  this->interrupt_time_.store(now, std::memory_order_relaxed);
+  ESP_LOGI(TAG, "Cleared audio queue and ignoring incoming audio for %u ms", INTERRUPT_IGNORE_AUDIO_MS);
 }
 
 void VoiceAssistantWebSocket::websocket_event_handler_(void *handler_args, 
@@ -577,54 +641,60 @@ void VoiceAssistantWebSocket::websocket_event_handler_(void *handler_args,
   instance->handle_websocket_event_(ws_event_id, ws_event_data);
 }
 
-void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t event_id, 
+void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t event_id,
                                                       esp_websocket_event_data_t *event_data) {
   switch (event_id) {
     case WEBSOCKET_EVENT_BEFORE_CONNECT:
       ESP_LOGI(TAG, "WebSocket connection attempt starting...");
       break;
-      
+
     case WEBSOCKET_EVENT_CONNECTED:
       ESP_LOGI(TAG, "WebSocket connected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_RUNNING;
       this->reconnect_attempts_ = 0;
       this->reconnect_pending_ = false;
       this->last_audio_send_ = millis();
-      
+
       if (this->state_callback_) {
         this->state_callback_(this->state_);
       }
-      
+
       // Trigger connected automation
       this->connected_trigger_.trigger();
       break;
-      
+
     case WEBSOCKET_EVENT_DISCONNECTED:
       ESP_LOGW(TAG, "WebSocket disconnected");
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
-      
+
       if (this->state_callback_) {
         this->state_callback_(this->state_);
       }
-      
-      // Trigger disconnected automation
       this->disconnected_trigger_.trigger();
-      
-      // Only attempt reconnection if we didn't receive an explicit disconnect message
-      // If explicit_disconnect_ is true, we should stay in idle mode
-      if (!this->explicit_disconnect_ && 
-          (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING || 
-           this->state_ == VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED)) {
+
+      // We need the main loop to destroy the client handle (the WS
+      // task can't safely call esp_websocket_client_destroy on itself
+      // — deadlock). Setting BOTH flags asks loop() to clean up AND
+      // queue a reconnect. Without this, the old code set
+      // reconnect_pending_ but the client handle stayed alive, so
+      // loop's reconnect check (`websocket_client_ == nullptr`) never
+      // tripped and reconnects never happened.
+      if (!this->explicit_disconnect_) {
+        this->pending_disconnect_ = true;
         this->reconnect_pending_ = true;
         this->last_reconnect_attempt_ = millis();
-      } else if (this->explicit_disconnect_) {
+      } else {
         ESP_LOGI(TAG, "Explicit disconnect received, staying in idle mode (no reconnection)");
-        // Reset flag for next time
         this->explicit_disconnect_ = false;
+        this->pending_disconnect_ = true;  // still need cleanup
       }
       break;
-      
+
     case WEBSOCKET_EVENT_DATA:
+      if (event_data == nullptr) {
+        ESP_LOGW(TAG, "WEBSOCKET_EVENT_DATA fired with null event_data, ignoring");
+        break;
+      }
       if (event_data->op_code == 0x02) {  // Binary frame
         this->process_received_audio_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
       } else if (event_data->op_code == 0x01) {  // Text frame
@@ -710,8 +780,13 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
       // Trigger error automation
       this->error_trigger_.trigger();
-      
-      // Attempt reconnection
+
+      // Same pattern as DISCONNECTED — ask loop() to destroy the
+      // handle (we're in the WS task, can't do it ourselves) AND
+      // queue a reconnect. Without `pending_disconnect_` set,
+      // `websocket_client_` stays non-null and the reconnect check
+      // in loop() never trips.
+      this->pending_disconnect_ = true;
       this->reconnect_pending_ = true;
       this->last_reconnect_attempt_ = millis();
       break;

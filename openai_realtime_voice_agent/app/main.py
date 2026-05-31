@@ -318,18 +318,12 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
         
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> Optional[OpenAIRealtimeLLMService]:
-            """Get OpenAI service for a specific client."""
-            if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
-            return self.openai_service
-        
+        # Interrupt handling lives in raw_audio_serializer.py now —
+        # see websocket_handler.setup_event_handlers for context.
         self.websocket_handler.setup_event_handlers(
             transport=self.websocket_transport,
             on_client_connected_callback=on_client_connected,
             on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
         )
         
         try:
