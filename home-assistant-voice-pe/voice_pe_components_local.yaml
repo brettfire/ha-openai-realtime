@@ -4,7 +4,7 @@
 # this repo (so the relative path `esphome/components` resolves):
 #
 #   packages:
-#     base: !include voice_pe_config.yaml
+#     base: !include voice_pe_base.yaml
 #     components: !include voice_pe_components_local.yaml
 #
 # Picks up uncommitted .cpp/.h changes in the custom component

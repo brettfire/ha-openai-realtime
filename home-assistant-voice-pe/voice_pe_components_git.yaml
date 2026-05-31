@@ -8,7 +8,7 @@
 #     base:
 #       url: https://github.com/brettfire/ha-openai-realtime
 #       ref: main
-#       files: [home-assistant-voice-pe/voice_pe_config.yaml]
+#       files: [home-assistant-voice-pe/voice_pe_base.yaml]
 #     components:
 #       url: https://github.com/brettfire/ha-openai-realtime
 #       ref: main
