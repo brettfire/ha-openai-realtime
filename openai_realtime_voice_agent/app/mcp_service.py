@@ -175,9 +175,9 @@ class HomeAssistantMCPService:
                     except BaseException as e:  # noqa: BLE001 — unwrap below
                         _log_unwrapped("fetch live-context snapshot", e)
                 else:
-                    logger.debug(
-                        "MCP server does not advertise resources capability "
-                        "— skipping live-context snapshot (HA <2026.5)"
+                    logger.info(
+                        "ℹ️ MCP server does not advertise resources capability "
+                        "— live-context snapshot disabled (requires HA 2026.5+)"
                     )
 
         return (prompt_text, snapshot_text)
