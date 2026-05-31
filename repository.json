@@ -1,12 +1,12 @@
 {
-  "name": "Home Assistant OpenAI Realtime Voice Agent",
-  "url": "https://github.com/fjfricke/ha-openai-realtime",
-  "maintainer": "Felix Fricke",
+  "name": "Home Assistant OpenAI Realtime Voice Agent (brettfire fork)",
+  "url": "https://github.com/brettfire/ha-openai-realtime",
+  "maintainer": "Brett Wilson",
   "addons": [
     {
       "slug": "openai_realtime_voice_agent",
       "name": "OpenAI Realtime Voice Agent",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ]
 }
