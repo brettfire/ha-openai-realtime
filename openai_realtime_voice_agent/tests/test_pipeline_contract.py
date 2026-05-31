@@ -3,11 +3,18 @@ import os
 import unittest
 from unittest.mock import patch
 
-from pipecat.frames.frames import Frame
+from pipecat.frames.frames import (
+    Frame,
+    InputAudioRawFrame,
+    SystemFrame,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from app.main import Application
-from app.realtime_session_router import RealtimeSessionRouter
+from app.realtime_session_router import (
+    PENDING_AUDIO_MAX_FRAMES,
+    RealtimeSessionRouter,
+)
 from app.websocket_handler import WebSocketHandler
 
 
@@ -108,6 +115,58 @@ class RealtimeSessionRouterContractTests(unittest.TestCase):
 
         self.assertIn("self._active is None", source)
         self.assertIn("StartFrame, EndFrame, CancelFrame, SystemFrame", source)
+
+
+def _make_audio_frame(payload: bytes = b"\x00\x01" * 480) -> InputAudioRawFrame:
+    # 480 int16 samples = 20ms @ 24 kHz mono; small enough that 200 frames
+    # fits comfortably in memory for the cap test.
+    return InputAudioRawFrame(audio=payload, sample_rate=24000, num_channels=1)
+
+
+class RouterColdStartBufferContractTests(unittest.IsolatedAsyncioTestCase):
+    """Lock in the contract: pre-roll audio that arrives during the
+    cold-start gap (after WS connect, before start_session) is buffered
+    rather than dropped, so the satellite's pre-roll survives the gap.
+    """
+
+    async def test_input_audio_is_buffered_while_no_active_session(self):
+        router = RealtimeSessionRouter()
+        frame = _make_audio_frame()
+
+        await router.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+        self.assertEqual(len(router._pending_input_audio), 1)
+        buffered_frame, buffered_dir = router._pending_input_audio[0]
+        self.assertIs(buffered_frame, frame)
+        self.assertEqual(buffered_dir, FrameDirection.DOWNSTREAM)
+
+    async def test_buffer_caps_and_drops_oldest_first(self):
+        router = RealtimeSessionRouter()
+
+        overflow = 5
+        frames = [
+            _make_audio_frame(bytes([i & 0xFF, 0]) * 8)
+            for i in range(PENDING_AUDIO_MAX_FRAMES + overflow)
+        ]
+        for f in frames:
+            await router.process_frame(f, FrameDirection.DOWNSTREAM)
+
+        self.assertEqual(len(router._pending_input_audio), PENDING_AUDIO_MAX_FRAMES)
+        self.assertEqual(router._pending_audio_dropped, overflow)
+        # Oldest `overflow` frames were popped; the buffer's new head is
+        # the first frame that survived.
+        head_frame, _ = router._pending_input_audio[0]
+        self.assertIs(head_frame, frames[overflow])
+
+    async def test_non_audio_non_system_frames_are_still_dropped(self):
+        router = RealtimeSessionRouter()
+
+        class NotAudioOrSystem(Frame):
+            pass
+
+        await router.process_frame(NotAudioOrSystem(), FrameDirection.DOWNSTREAM)
+
+        self.assertEqual(len(router._pending_input_audio), 0)
 
 
 if __name__ == "__main__":

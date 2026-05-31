@@ -150,6 +150,27 @@ class VoiceAssistantWebSocket : public Component {
   std::vector<int16_t> mono_buffer_;       // 32-bit stereo -> 16-bit mono (input)
   std::vector<int16_t> resampled_buffer_;  // 16kHz -> 24kHz resampling (1.5x upsampling)
 
+  // Pre-roll ring buffer — captures the most recent PREROLL_MS of mic
+  // audio (post-mono-conversion: 16-bit, mono, MICROPHONE_SAMPLE_RATE)
+  // so that when a wake-word fires and we connect, we can replay what
+  // the user said *during* the cold-start window. Without this the
+  // user's first ~1-2s of speech (between wake-word and "WS connected
+  // + RUNNING") is dropped on the floor in on_microphone_data_.
+  //
+  // Filled and drained exclusively on the microphone callback task,
+  // so no synchronisation primitives are needed. Allocated in PSRAM
+  // at setup(); ~48 KB at default 1500ms × 16 kHz × 2 bytes.
+  static const uint32_t PREROLL_MS = 1500;
+  static const size_t PREROLL_CAPACITY_SAMPLES =
+      (MICROPHONE_SAMPLE_RATE * PREROLL_MS) / 1000;
+  int16_t *preroll_buffer_{nullptr};  // ring of int16 samples
+  size_t preroll_head_{0};            // next write index, mod capacity
+  size_t preroll_count_{0};           // valid samples, capped at capacity
+
+  void preroll_push_(const int16_t *samples, size_t count);
+  void preroll_drain_and_send_();
+  void resample_and_send_(const int16_t *mono_16khz, size_t mono_count);
+
   std::atomic<bool> pending_start_{false};
   std::atomic<bool> pending_disconnect_{false};  // Flag to disconnect in loop() (cannot be called from websocket task)
   std::atomic<bool> reconnect_pending_{false};

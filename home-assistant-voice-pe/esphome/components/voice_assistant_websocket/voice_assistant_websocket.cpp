@@ -8,6 +8,7 @@
 
 #ifdef USE_ESP_IDF
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #endif
 
 static const char *TAG = "voice_assistant_websocket";
@@ -55,6 +56,19 @@ void VoiceAssistantWebSocket::setup() {
   this->speaker_mutex_ = xSemaphoreCreateMutex();
   if (this->speaker_mutex_ == nullptr) {
     ESP_LOGE(TAG, "Failed to create speaker_mutex_");
+  }
+
+  // Pre-roll ring buffer in PSRAM. Voice PE has 8 MB PSRAM, this is
+  // ~48 KB at 1500ms. Internal SRAM is reserved for the wake-word
+  // tensor; PSRAM access is slower but the throughput we need is
+  // trivial (~32 KB/s write, burst read at drain time).
+  size_t preroll_bytes = PREROLL_CAPACITY_SAMPLES * sizeof(int16_t);
+  this->preroll_buffer_ = (int16_t *) heap_caps_malloc(preroll_bytes, MALLOC_CAP_SPIRAM);
+  if (this->preroll_buffer_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate %zu bytes of PSRAM for pre-roll buffer", preroll_bytes);
+  } else {
+    ESP_LOGCONFIG(TAG, "  Pre-roll buffer: %zu bytes PSRAM (%ums @ %uHz)",
+                  preroll_bytes, PREROLL_MS, MICROPHONE_SAMPLE_RATE);
   }
 #endif
   this->state_.store(VOICE_ASSISTANT_WEBSOCKET_IDLE, std::memory_order_relaxed);
@@ -665,12 +679,40 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
-  // Only process if connected and running
-  if (!this->is_connected() ||
-      this->state_.load(std::memory_order_relaxed) != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+  // Microphone is configured for 16kHz, 32-bit, stereo (required by
+  // micro_wake_word). OpenAI expects 24kHz, 16-bit, mono (non-beta
+  // API). We always do the stereo->mono pass first because that is
+  // the format we either buffer (pre-roll) or resample-and-send.
+  size_t stereo_32bit_samples = data.size() / (4 * 2);
+  size_t mono_samples = stereo_32bit_samples;
+
+  if (mono_samples == 0) {
     return;
   }
-  
+
+  if (this->mono_buffer_.size() < mono_samples) {
+    this->mono_buffer_.resize(mono_samples);
+  }
+
+  const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
+  int16_t *mono_16bit = this->mono_buffer_.data();
+  for (size_t i = 0; i < stereo_32bit_samples; i++) {
+    mono_16bit[i] = static_cast<int16_t>(stereo_32bit[i * 2] >> 16);
+  }
+
+  // When not in the RUNNING state we have nowhere to send audio yet
+  // — but we still want to capture it, so a wake-word that fires now
+  // can replay the user's first ~1500ms of speech as soon as we
+  // connect. Push to the pre-roll ring and return.
+  //
+  // Includes the wake word itself in the replay, which is harmless:
+  // OpenAI's server VAD treats it as preamble and the model just
+  // sees "Hey Nabu, turn on the lights" with no semantic harm.
+  if (this->state_.load(std::memory_order_relaxed) != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    this->preroll_push_(mono_16bit, mono_samples);
+    return;
+  }
+
   // In wake-word-only mode, mute the mic while the bot is speaking so
   // playback echo (or normal room noise) can't trigger server VAD. In
   // full-duplex mode, keep streaming and rely on the Voice PE's
@@ -681,53 +723,105 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
       this->is_bot_speaking()) {
     return;
   }
-  
-  // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
-  // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
-  // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
-  
-  size_t stereo_32bit_samples = data.size() / (4 * 2);  // 4 bytes per 32-bit sample, 2 channels
-  size_t mono_16khz_samples = stereo_32bit_samples;
-  
-  if (this->mono_buffer_.size() < mono_16khz_samples) {
-    this->mono_buffer_.resize(mono_16khz_samples);
+
+  if (!this->is_connected()) {
+    return;
   }
-  
-  const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
-  int16_t *mono_16bit = this->mono_buffer_.data();
-  
-  for (size_t i = 0; i < stereo_32bit_samples; i++) {
-    int32_t left_sample = stereo_32bit[i * 2];
-    mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
+
+  // Drain any captured pre-roll BEFORE the current chunk so PCM
+  // order is preserved (pre-roll = older, current = newer).
+  if (this->preroll_count_ > 0) {
+    this->preroll_drain_and_send_();
   }
-  
-  // Resample from 16kHz to 24kHz (1.5x upsampling)
-  size_t resampled_24khz_samples = (mono_16khz_samples * INPUT_SAMPLE_RATE) / MICROPHONE_SAMPLE_RATE;
-  if (this->resampled_buffer_.size() < resampled_24khz_samples) {
-    this->resampled_buffer_.resize(resampled_24khz_samples);
+
+  this->resample_and_send_(mono_16bit, mono_samples);
+}
+
+void VoiceAssistantWebSocket::preroll_push_(const int16_t *samples, size_t count) {
+  if (this->preroll_buffer_ == nullptr || count == 0) {
+    return;
   }
-  
-  int16_t *resampled_24khz = this->resampled_buffer_.data();
-  
-  // Linear interpolation resampling: 16kHz -> 24kHz
-  for (size_t i = 0; i < resampled_24khz_samples; i++) {
+  for (size_t i = 0; i < count; i++) {
+    this->preroll_buffer_[this->preroll_head_] = samples[i];
+    this->preroll_head_ = (this->preroll_head_ + 1) % PREROLL_CAPACITY_SAMPLES;
+    if (this->preroll_count_ < PREROLL_CAPACITY_SAMPLES) {
+      this->preroll_count_++;
+    }
+  }
+}
+
+void VoiceAssistantWebSocket::preroll_drain_and_send_() {
+  if (this->preroll_buffer_ == nullptr || this->preroll_count_ == 0) {
+    return;
+  }
+
+  size_t count = this->preroll_count_;
+  ESP_LOGI(TAG, "Draining pre-roll buffer (%zu samples, %ums of captured audio)",
+           count, (uint32_t)((count * 1000) / MICROPHONE_SAMPLE_RATE));
+
+  // Oldest valid sample is `count` samples behind head, wrapping.
+  size_t start = (this->preroll_head_ + PREROLL_CAPACITY_SAMPLES - count) % PREROLL_CAPACITY_SAMPLES;
+
+  // Send in AUDIO_SEND_INTERVAL_MS-sized chunks (100ms = 1600 samples
+  // @ 16 kHz) so the addon sees the same cadence it sees during
+  // normal real-time streaming.
+  const size_t chunk_samples = (MICROPHONE_SAMPLE_RATE * AUDIO_SEND_INTERVAL_MS) / 1000;
+
+  // Reset count first so a re-entrant call (shouldn't happen — single
+  // task — but defensive) doesn't re-drain the same data.
+  this->preroll_count_ = 0;
+
+  size_t cursor = start;
+  size_t remaining = count;
+  while (remaining > 0) {
+    size_t take = std::min(remaining, chunk_samples);
+    if (cursor + take <= PREROLL_CAPACITY_SAMPLES) {
+      // Contiguous read, no wrap-around in this chunk.
+      this->resample_and_send_(&this->preroll_buffer_[cursor], take);
+      cursor += take;
+      if (cursor == PREROLL_CAPACITY_SAMPLES) {
+        cursor = 0;
+      }
+    } else {
+      // Chunk straddles the end of the ring — split into two sends.
+      size_t first = PREROLL_CAPACITY_SAMPLES - cursor;
+      this->resample_and_send_(&this->preroll_buffer_[cursor], first);
+      size_t second = take - first;
+      this->resample_and_send_(&this->preroll_buffer_[0], second);
+      cursor = second;
+    }
+    remaining -= take;
+  }
+}
+
+void VoiceAssistantWebSocket::resample_and_send_(const int16_t *mono_16khz, size_t mono_count) {
+  if (mono_count == 0) {
+    return;
+  }
+  size_t resampled_count = (mono_count * INPUT_SAMPLE_RATE) / MICROPHONE_SAMPLE_RATE;
+  if (this->resampled_buffer_.size() < resampled_count) {
+    this->resampled_buffer_.resize(resampled_count);
+  }
+  int16_t *resampled = this->resampled_buffer_.data();
+  // Linear interpolation resampling: 16kHz -> 24kHz (matches the
+  // upstream resample step that lived inline in on_microphone_data_
+  // before pre-roll added a second caller).
+  for (size_t i = 0; i < resampled_count; i++) {
     float source_pos = (float)i * (float)MICROPHONE_SAMPLE_RATE / (float)INPUT_SAMPLE_RATE;
     size_t source_idx = (size_t)source_pos;
     float fraction = source_pos - source_idx;
-    
-    if (source_idx + 1 < mono_16khz_samples) {
-      int16_t sample0 = mono_16bit[source_idx];
-      int16_t sample1 = mono_16bit[source_idx + 1];
-      resampled_24khz[i] = static_cast<int16_t>(sample0 + (sample1 - sample0) * fraction);
-    } else if (source_idx < mono_16khz_samples) {
-      resampled_24khz[i] = mono_16bit[source_idx];
+    if (source_idx + 1 < mono_count) {
+      int16_t s0 = mono_16khz[source_idx];
+      int16_t s1 = mono_16khz[source_idx + 1];
+      resampled[i] = static_cast<int16_t>(s0 + (s1 - s0) * fraction);
+    } else if (source_idx < mono_count) {
+      resampled[i] = mono_16khz[source_idx];
     } else {
-      resampled_24khz[i] = mono_16bit[mono_16khz_samples - 1];
+      resampled[i] = mono_16khz[mono_count - 1];
     }
   }
-  
-  size_t resampled_bytes = resampled_24khz_samples * BYTES_PER_SAMPLE;
-  this->send_audio_chunk_(reinterpret_cast<const uint8_t *>(resampled_24khz), resampled_bytes);
+  this->send_audio_chunk_(reinterpret_cast<const uint8_t *>(resampled),
+                          resampled_count * BYTES_PER_SAMPLE);
 }
 
 void VoiceAssistantWebSocket::set_barge_in_mode(BargeInMode mode) {
