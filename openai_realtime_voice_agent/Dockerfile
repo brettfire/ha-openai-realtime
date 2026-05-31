@@ -50,6 +50,12 @@ COPY app/ /tmp/openai_realtime_voice_agent/app/
 WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV POETRY_VIRTUALENVS_CREATE=false
+# Constrain setuptools in PEP 517 build envs. llvmlite 0.44.0 calls
+# Distribution.spawn(dry_run=...) which setuptools removed in 75.0; without
+# this, llvmlite's wheel build fails with
+#   TypeError: spawn() got an unexpected keyword argument 'dry_run'
+RUN echo "setuptools<70" > /tmp/build-constraints.txt
+ENV PIP_CONSTRAINT=/tmp/build-constraints.txt
 # Find and set LLVM_CONFIG path
 RUN \
     LLVM_CONFIG_PATH=$(which llvm-config || find /usr/bin /usr/local/bin -name llvm-config* 2>/dev/null | head -1) \
