@@ -27,6 +27,22 @@ enum VoiceAssistantWebSocketState {
   VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED
 };
 
+// How the satellite handles the user interrupting the bot mid-speech.
+// WAKE_WORD: mic is muted while the bot is speaking, so playback echo
+//   can't trigger server VAD; barge-in only happens when the local
+//   wake-word detector fires (which then sends a JSON interrupt
+//   message to the addon). This is the safe default — no ambient-noise
+//   false-triggers.
+// FULL_DUPLEX: mic keeps streaming during playback (relies on the
+//   Voice PE's hardware AEC). Server-side VAD on the OpenAI Realtime
+//   API detects user speech and cancels the bot response
+//   automatically. Snappier barge-in but vulnerable to false triggers
+//   from background noise, like the ChatGPT app.
+enum BargeInMode {
+  BARGE_IN_WAKE_WORD = 0,
+  BARGE_IN_FULL_DUPLEX = 1,
+};
+
 class VoiceAssistantWebSocket : public Component {
  public:
   void setup() override;
@@ -36,15 +52,20 @@ class VoiceAssistantWebSocket : public Component {
   void set_server_url(const std::string &url) { this->server_url_ = url; }
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_speaker(speaker::Speaker *spkr) { this->speaker_ = spkr; }
-  
+
   void start();
   void stop();
   void request_start();
   void interrupt();  // Send interrupt message to server and stop speaker
-  
+
   bool is_running() const { return this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
   bool is_connected() const { return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_); }
   bool is_bot_speaking() const;  // Check if bot is currently speaking (within 500ms of last audio)
+
+  // Barge-in mode controls whether mic audio is suppressed while the
+  // bot is speaking. See BargeInMode enum docs.
+  void set_barge_in_mode(BargeInMode mode);
+  BargeInMode get_barge_in_mode() const { return this->barge_in_mode_; }
   
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
     this->state_callback_ = std::move(callback);
@@ -123,6 +144,10 @@ class VoiceAssistantWebSocket : public Component {
   uint32_t last_reconnect_attempt_{0};
   uint32_t interrupt_time_{0};  // Time when interrupt was sent (to ignore audio for a short period)
   static const uint32_t INTERRUPT_IGNORE_AUDIO_MS = 500;  // Ignore audio for 500ms after interrupt
+
+  // Default to the safer wake-word-only mode; YAML can override at
+  // startup (e.g. via a restored template select) and at runtime.
+  BargeInMode barge_in_mode_{BARGE_IN_WAKE_WORD};
 };
 
 // Action classes for automations (defined outside the main class)
@@ -171,6 +196,17 @@ template<typename... Ts> class VoiceAssistantWebSocketInterruptAction : public A
  public:
   VoiceAssistantWebSocketInterruptAction(VoiceAssistantWebSocket *parent) : parent_(parent) {}
   void play(const Ts &...x) override { this->parent_->interrupt(); }
+ protected:
+  VoiceAssistantWebSocket *parent_;
+};
+
+template<typename... Ts> class VoiceAssistantWebSocketSetBargeInModeAction : public Action<Ts...> {
+ public:
+  VoiceAssistantWebSocketSetBargeInModeAction(VoiceAssistantWebSocket *parent) : parent_(parent) {}
+  TEMPLATABLE_VALUE(BargeInMode, mode)
+  void play(Ts... x) override {
+    this->parent_->set_barge_in_mode(this->mode_.value(x...));
+  }
  protected:
   VoiceAssistantWebSocket *parent_;
 };

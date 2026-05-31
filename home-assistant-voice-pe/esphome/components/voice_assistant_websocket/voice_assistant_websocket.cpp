@@ -462,9 +462,12 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     return;
   }
   
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
-    return;  // Don't send microphone audio while bot is speaking
+  // In wake-word-only mode, mute the mic while the bot is speaking so
+  // playback echo (or normal room noise) can't trigger server VAD. In
+  // full-duplex mode, keep streaming and rely on the Voice PE's
+  // hardware AEC + server VAD on the OpenAI Realtime API for barge-in.
+  if (this->barge_in_mode_ == BARGE_IN_WAKE_WORD && this->is_bot_speaking()) {
+    return;
   }
   
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
@@ -513,6 +516,14 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   
   size_t resampled_bytes = resampled_24khz_samples * BYTES_PER_SAMPLE;
   this->send_audio_chunk_(reinterpret_cast<const uint8_t *>(resampled_24khz), resampled_bytes);
+}
+
+void VoiceAssistantWebSocket::set_barge_in_mode(BargeInMode mode) {
+  if (this->barge_in_mode_ != mode) {
+    this->barge_in_mode_ = mode;
+    ESP_LOGI(TAG, "Barge-in mode set to %s",
+             mode == BARGE_IN_FULL_DUPLEX ? "full_duplex" : "wake_word");
+  }
 }
 
 bool VoiceAssistantWebSocket::is_bot_speaking() const {

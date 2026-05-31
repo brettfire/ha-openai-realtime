@@ -1091,6 +1091,32 @@ external_components:
       - voice_kit
     refresh: 0s
 
+# Barge-in mode — surfaced to Home Assistant as
+# `select.<device>_barge_in_mode`. "Wake Word Only" keeps the mic muted
+# while the bot speaks (safe default, no ambient-noise false triggers).
+# "Full Duplex" keeps the mic streaming during playback so server VAD
+# on the OpenAI Realtime API can detect mid-response speech and barge
+# in automatically — relies on the Voice PE's hardware AEC, snappier
+# but vulnerable to background noise like the ChatGPT app.
+select:
+  - platform: template
+    name: "Barge-in Mode"
+    id: barge_in_mode_select
+    icon: mdi:account-voice
+    optimistic: true
+    restore_value: true
+    initial_option: "Wake Word Only"
+    options:
+      - "Wake Word Only"
+      - "Full Duplex"
+    on_value:
+      - voice_assistant_websocket.set_barge_in_mode:
+          id: voice_assistant_ws
+          mode: !lambda |-
+            if (x == "Full Duplex")
+              return voice_assistant_websocket::BARGE_IN_FULL_DUPLEX;
+            return voice_assistant_websocket::BARGE_IN_WAKE_WORD;
+
 # Voice Assistant WebSocket Component
 voice_assistant_websocket:
   id: voice_assistant_ws

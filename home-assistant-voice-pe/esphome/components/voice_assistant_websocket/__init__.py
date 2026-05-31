@@ -14,6 +14,11 @@ voice_assistant_websocket_ns = cg.esphome_ns.namespace("voice_assistant_websocke
 VoiceAssistantWebSocket = voice_assistant_websocket_ns.class_(
     "VoiceAssistantWebSocket", cg.Component
 )
+BargeInMode = voice_assistant_websocket_ns.enum("BargeInMode")
+BARGE_IN_MODES = {
+    "wake_word": BargeInMode.BARGE_IN_WAKE_WORD,
+    "full_duplex": BargeInMode.BARGE_IN_FULL_DUPLEX,
+}
 
 CONF_SERVER_URL = "server_url"
 CONF_VOICE_ASSISTANT_WEBSOCKET = "voice_assistant_websocket"
@@ -21,6 +26,7 @@ CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_ERROR = "on_error"
 CONF_ON_STOPPED = "on_stopped"
+CONF_MODE = "mode"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -156,4 +162,25 @@ async def voice_assistant_websocket_interrupt_to_code(config, action_id, templat
 async def voice_assistant_websocket_is_bot_speaking_to_code(config, condition_id, template_arg, args):
     paren = await cg.get_variable(config[CONF_ID])
     return cg.new_Pvariable(condition_id, template_arg, paren)
+
+
+VOICE_ASSISTANT_WEBSOCKET_SET_BARGE_IN_MODE_SCHEMA = cv.Schema(
+    {
+        cv.Required(CONF_ID): cv.use_id(VoiceAssistantWebSocket),
+        cv.Required(CONF_MODE): cv.templatable(cv.enum(BARGE_IN_MODES, lower=True)),
+    }
+)
+
+
+@automation.register_action(
+    "voice_assistant_websocket.set_barge_in_mode",
+    voice_assistant_websocket_ns.class_("VoiceAssistantWebSocketSetBargeInModeAction"),
+    VOICE_ASSISTANT_WEBSOCKET_SET_BARGE_IN_MODE_SCHEMA,
+)
+async def voice_assistant_websocket_set_barge_in_mode_to_code(config, action_id, template_arg, args):
+    paren = await cg.get_variable(config[CONF_ID])
+    var = cg.new_Pvariable(action_id, template_arg, paren)
+    template_ = await cg.templatable(config[CONF_MODE], args, BargeInMode)
+    cg.add(var.set_mode(template_))
+    return var
 
