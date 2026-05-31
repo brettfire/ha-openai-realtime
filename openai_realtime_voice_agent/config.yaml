@@ -10,6 +10,7 @@ init: false
 startup: application
 boot: auto
 host_network: true
+homeassistant_api: true
 options:
   openai_api_key: ""
   websocket_port: 8080
