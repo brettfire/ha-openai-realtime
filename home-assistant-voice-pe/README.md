@@ -28,24 +28,70 @@ cp secrets.yaml.example secrets.yaml
 ```
 
 Edit `secrets.yaml`:
-- `wifi_ssid`: Your WiFi network name
-- `wifi_password`: Your WiFi password
-- `api_encryption_key`: Home Assistant API encryption key
-- `ota_password`: Password for OTA updates
-- `server_url`: WebSocket URL for the OpenAI Realtime addon (e.g., `ws://homeassistant.local:8080`)
+- `wifi_ssid` / `wifi_password`: WiFi network (shared across devices)
+- `api_encryption_key`: HA API encryption key for the default
+  speaker (`ha-voice-openai`). Per-device entries (e.g.
+  `api_encryption_key_voicepe2`) are added when you onboard
+  additional speakers — see [Multi-device setup](#multi-device-setup).
+- `ota_password`: Password for OTA updates (shared)
+- `server_url`: WebSocket URL for the OpenAI Realtime addon
+  (e.g., `ws://homeassistant.local:10245`)
 
 ### 3. Compile and Flash
 
+The repo ships with a `justfile` wrapping the common ESPHome
+commands. Run `just` (no args) from the repo root to see all
+recipes.
+
 ```bash
-# Compile
-poetry run esphome compile voice_pe_config.yaml
-
-# Flash via USB
-poetry run esphome upload voice_pe_config.yaml --device /dev/cu.usbmodem101 (or the correct device name for your device. See `ls /dev/cu.*` for the correct device name.)
-
-# Or flash via OTA (after first USB upload)
-poetry run esphome upload voice_pe_config.yaml
+just validate                   # validate the YAML
+just compile                    # compile only
+just flash                      # compile + OTA-flash + stream logs
+just port=/dev/cu.usbmodem101 flash-usb   # USB flash
+just logs                       # stream logs from a running device
+just clean                      # wipe build cache
 ```
+
+Or run `poetry run esphome ...` directly if you prefer.
+
+## Multi-device setup
+
+For a second speaker, create a tiny per-device wrapper next to
+`voice_pe_config.yaml` (template: `voice_pe_example.yaml`):
+
+```yaml
+# voice_pe_voicepe2.yaml
+packages:
+  base: !include voice_pe_config.yaml
+
+substitutions:
+  device_name: voicepe2
+
+api:
+  encryption:
+    key: !secret api_encryption_key_voicepe2
+```
+
+Add the per-device key to `secrets.yaml`:
+
+```yaml
+api_encryption_key_voicepe2: "<unique base64 32 bytes>"
+# Generate with: openssl rand -base64 32
+```
+
+Flash:
+
+```bash
+just flash device=voicepe2
+just logs device=voicepe2
+```
+
+If instead you want to onboard the device via HA's ESPHome Device
+Builder addon (no local repo needed), use the **git package**
+flavor — `voice_pe_example.yaml` shows both. Pasted into the HA
+ESPHome dashboard with the per-device key added to
+`/config/esphome/secrets.yaml`, ESPHome fetches the base + custom
+component from this repo at compile time.
 
 ## Configuration
 

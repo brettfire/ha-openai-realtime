@@ -47,6 +47,11 @@ This repository contains two main components:
 
 1. **Install the Server Addon**: Follow the [server documentation](openai_realtime_voice_agent/README.md)
 2. **Configure ESP32 Device**: Follow the [client documentation](home-assistant-voice-pe/README.md)
+3. **Add more speakers (optional)**: see [Multi-device setup](home-assistant-voice-pe/README.md#multi-device-setup) in the client docs. The pattern is a small per-device wrapper YAML + a unique `api_encryption_key_<device>` entry in secrets.
+
+Common dev commands are wrapped in a `justfile` at the repo root —
+run `just` (no args) to see the list. AI agents working in this repo
+should also read [`AGENTS.md`](AGENTS.md).
 
 ## Prerequisites
 
