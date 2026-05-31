@@ -12,7 +12,7 @@ from pipecat.frames.frames import (
     StartFrame,
     SystemFrame,
 )
-from pipecat.pipeline.task import FrameProcessorSetup
+from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService

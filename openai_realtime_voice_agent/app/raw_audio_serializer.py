@@ -9,7 +9,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     OutputAudioRawFrame,
 )
-from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.serializers.base_serializer import FrameSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +26,6 @@ class RawAudioSerializer(FrameSerializer):
 
     Unknown text frames are dropped with a debug log.
     """
-
-    @property
-    def type(self) -> FrameSerializerType:
-        """Get the serialization type - binary for raw audio."""
-        return FrameSerializerType.BINARY
 
     async def deserialize(
         self, message: Union[bytes, str]
