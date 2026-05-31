@@ -35,11 +35,20 @@ RUN \
 # Switch to bash after installation
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Install Poetry
+# Install Poetry 1.x (uses pip's installer directly so it honors
+# PIP_NO_BUILD_ISOLATION). Poetry 2.x runs its own self-installer and
+# the global setuptools below is ignored. Also pin an old setuptools
+# globally; combined with --no-build-isolation it satisfies the build
+# requirements of older C-extension deps (notably llvmlite 0.44.0,
+# pinned transitively by pipecat-ai's numba==0.61.2) without poetry
+# creating a fresh build venv that pulls setuptools>=75 — which would
+# fail with `spawn() got an unexpected keyword argument 'dry_run'`.
 RUN \
-    pip3 install --no-cache-dir --break-system-packages poetry \
+    pip3 install --no-cache-dir --break-system-packages 'poetry<2' \
     && poetry config virtualenvs.create false \
-    && poetry config virtualenvs.in-project false
+    && poetry config virtualenvs.in-project false \
+    && poetry config installer.modern-installation false \
+    && pip3 install --no-cache-dir --break-system-packages 'setuptools<70' 'wheel'
 
 # Copy Poetry configuration files and app directory for package installation
 COPY pyproject.toml poetry.lock* /tmp/
@@ -50,12 +59,7 @@ COPY app/ /tmp/openai_realtime_voice_agent/app/
 WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV POETRY_VIRTUALENVS_CREATE=false
-# Constrain setuptools in PEP 517 build envs. llvmlite 0.44.0 calls
-# Distribution.spawn(dry_run=...) which setuptools removed in 75.0; without
-# this, llvmlite's wheel build fails with
-#   TypeError: spawn() got an unexpected keyword argument 'dry_run'
-RUN echo "setuptools<70" > /tmp/build-constraints.txt
-ENV PIP_CONSTRAINT=/tmp/build-constraints.txt
+ENV PIP_NO_BUILD_ISOLATION=1
 # Find and set LLVM_CONFIG path
 RUN \
     LLVM_CONFIG_PATH=$(which llvm-config || find /usr/bin /usr/local/bin -name llvm-config* 2>/dev/null | head -1) \
