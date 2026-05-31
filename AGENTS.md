@@ -184,42 +184,6 @@ is fragile (the same setuptools/llvmlite issues hit again).
 
 ## Working with the ESPHome firmware (satellite-side)
 
-### Repo layout
-
-```
-home-assistant-voice-pe/
-├── voice_pe_config.yaml      ← OUR firmware. Compile and flash this one.
-├── voice_pe_upstream.yaml    ← frozen snapshot of the stock HA Voice PE
-│                                YAML for reference / diff. Do NOT flash.
-├── secrets.yaml              ← local secrets, gitignored
-├── esphome/components/voice_assistant_websocket/  ← custom C++ component
-└── ...
-```
-
-`voice_pe_upstream.yaml` is here so we can diff against stock when
-upstream releases a new version, see what changed, and pull in
-anything relevant by hand. We don't layer via ESPHome's `packages:` /
-`!include` mechanism — divergence between our YAML and upstream is
-deliberate (we strip the HA-Voice-pipeline + STT/TTS plumbing in
-favor of the direct WebSocket-to-addon path), and the merge
-semantics of `packages:` get awkward when you're overriding deeply
-nested fields. Maintaining a focused standalone YAML is easier to
-reason about than chasing merge surprises.
-
-If you wanted to formalize the layering anyway, the relevant tools
-are:
-- `packages: { upstream: !include voice_pe_upstream.yaml }` for
-  composition (list sections concatenate, map sections deep-merge,
-  with `!extend`/`!remove` tags for fine control).
-- `substitutions:` for repeated values only — *not* a vehicle for
-  swapping or overriding whole blocks.
-
-When upstream releases a new version, the workflow is: refresh
-`voice_pe_upstream.yaml` from the `esphome/home-assistant-voice-pe`
-repo at the new tag, `git diff` it against the previous version,
-copy any improvements (LED behaviors, new wake-word models,
-hardware fixes) into our `voice_pe_config.yaml` by hand.
-
 ### Local toolchain
 
 The user has esphome installed via poetry in `home-assistant-voice-pe/`.
