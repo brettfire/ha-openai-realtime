@@ -25,17 +25,22 @@ env:
 jobs:
   build:
     name: Build for ${{ matrix.arch }}
-    runs-on: ubuntu-latest
+    # Run aarch64 on a native ARM runner (free for public repos as of
+    # Jan 2025) so we skip QEMU emulation. Cold aarch64 builds drop
+    # from ~19 min to ~3 min.
+    runs-on: ${{ matrix.runs_on }}
     permissions:
       contents: read
       packages: write
-    
+
     strategy:
       fail-fast: false
       matrix:
-        arch:
-          - aarch64
-          - amd64
+        include:
+          - arch: aarch64
+            runs_on: ubuntu-24.04-arm
+          - arch: amd64
+            runs_on: ubuntu-latest
     
     steps:
       - name: Checkout repository
