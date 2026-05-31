@@ -1,6 +1,8 @@
 """MCP service integration using Pipecat's MCPClient with StreamableHTTP."""
 import logging
 from typing import Optional
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from pipecat.services.mcp_service import MCPClient, StreamableHttpParameters
 
 logger = logging.getLogger(__name__)
@@ -55,23 +57,34 @@ class HomeAssistantMCPService:
         API, typically "Assist") whose content is ``llm_api.api_prompt`` —
         the rich system prompt regular Assist injects on every request,
         listing exposed entities, areas, and current states. Pipecat's
-        MCPClient only fetches tools, so without this the OpenAI Realtime
-        session knows the verbs (HassTurnOn/Off, GetLiveContext, ...) but
-        not the nouns. Returns the prompt text, or None if no prompt is
-        offered.
+        MCPClient only fetches tools (and on 0.0.97 it doesn't expose
+        the underlying ClientSession), so we open our own short-lived
+        streamable-HTTP session for this one extra call.
+        Returns the prompt text, or None if no prompt is offered.
         """
-        if not self.mcp_client or not self.mcp_client._active_session:
+        if not self.url:
             return None
-        session = self.mcp_client._active_session
-        prompts_result = await session.list_prompts()
-        if not prompts_result.prompts:
-            return None
-        prompt_name = prompts_result.prompts[0].name
-        prompt_result = await session.get_prompt(prompt_name)
-        if not prompt_result.messages:
-            return None
-        content = prompt_result.messages[0].content
-        return getattr(content, "text", None)
+        headers = (
+            {"Authorization": f"Bearer {self.access_token}"}
+            if self.access_token
+            else None
+        )
+        async with streamablehttp_client(url=self.url, headers=headers) as (
+            read_stream,
+            write_stream,
+            _,
+        ):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                prompts_result = await session.list_prompts()
+                if not prompts_result.prompts:
+                    return None
+                prompt_name = prompts_result.prompts[0].name
+                prompt_result = await session.get_prompt(prompt_name)
+                if not prompt_result.messages:
+                    return None
+                content = prompt_result.messages[0].content
+                return getattr(content, "text", None)
 
 
 
