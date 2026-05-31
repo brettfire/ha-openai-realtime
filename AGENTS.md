@@ -225,18 +225,26 @@ must be in download mode (hold BOOT, plug in USB).
 
 ### Multi-device pattern (one base YAML, per-device wrappers)
 
-`voice_pe_config.yaml` is the base config and also the default
-flashable for the original `ha-voice-openai` device. For additional
-speakers, create a tiny per-device wrapper. Two flavors depending on
-where the wrapper will be compiled:
+The firmware is split into composable shards so wrappers can pick
+between LOCAL and GIT sources for the custom component without
+fighting ESPHome's `packages:` list-concat merge behavior:
+
+| File | Purpose |
+|---|---|
+| `voice_pe_base.yaml` | Bulk (~1200 lines) of firmware logic. NO `external_components`, NO `api.encryption.key`. Cannot be flashed standalone. |
+| `voice_pe_components_local.yaml` | `external_components`, `type: local` for `voice_assistant_websocket`. Used in the local dev loop. |
+| `voice_pe_components_git.yaml` | `external_components`, `type: git`. Used by ESPHome instances that don't have this repo cloned. |
+| `voice_pe_config.yaml` | Thin wrapper for the default `ha-voice-openai` device. `just flash` targets this. |
+| `voice_pe_example.yaml` | Template wrapper showing both flavors for additional speakers. |
 
 **Flavor A — local `!include` (for compiling from a clone of this
 repo, e.g. your Mac with `just flash device=...`):**
 
 ```yaml
-# voice_pe_voicepe2.yaml — lives next to voice_pe_config.yaml
+# voice_pe_voicepe2.yaml — lives next to voice_pe_base.yaml
 packages:
-  base: !include voice_pe_config.yaml
+  base: !include voice_pe_base.yaml
+  components: !include voice_pe_components_local.yaml
 
 substitutions:
   device_name: voicepe2
@@ -250,51 +258,58 @@ api:
 Builder addon UI or any standalone ESPHome instance):**
 
 ```yaml
-# Paste straight into HA ESPHome dashboard. Self-contained.
+# Paste straight into the HA ESPHome dashboard. Self-contained.
 packages:
   base:
     url: https://github.com/brettfire/ha-openai-realtime
     ref: main
-    files: [home-assistant-voice-pe/voice_pe_config.yaml]
+    files: [home-assistant-voice-pe/voice_pe_base.yaml]
+  components:
+    url: https://github.com/brettfire/ha-openai-realtime
+    ref: main
+    files: [home-assistant-voice-pe/voice_pe_components_git.yaml]
 
 substitutions:
   device_name: voicepe2
+  # ESPHome resolves `file:` paths in packaged YAMLs against the
+  # consuming wrapper's directory, not the package cache, so the
+  # base's `wake_sound.flac` (a relative path) won't be findable in
+  # /config/esphome/. Override to a github raw URL so ESPHome
+  # fetches it at compile time:
+  wake_word_triggered_sound_file: https://raw.githubusercontent.com/brettfire/ha-openai-realtime/main/home-assistant-voice-pe/wake_sound.flac
 
 api:
   encryption:
     key: !secret api_encryption_key_voicepe2
-
-# REQUIRED for flavor B. The base ships
-# `external_components: type: local, path: esphome/components` which
-# resolves against the *consuming YAML's* working directory, not the
-# cached package — so when there's no repo cloned next to the wrapper
-# (which is the whole point of using flavor B), the local source
-# isn't found and compile fails. We override the full list to use
-# git for both components. voice_kit is re-declared because ESPHome
-# `packages:` REPLACES lists wholesale rather than merging them.
-external_components:
-  - source:
-      type: git
-      url: https://github.com/brettfire/ha-openai-realtime
-      ref: main
-      path: home-assistant-voice-pe/esphome/components
-    components: [voice_assistant_websocket]
-    refresh: 0s
-  - source:
-      type: git
-      url: https://github.com/esphome/home-assistant-voice-pe
-      ref: 25.11.0
-    components: [voice_kit]
-    refresh: 0s
 ```
 
-Both produce identical firmware. Flavor B also requires the
-dashboard's `/config/esphome/secrets.yaml` to define
-`api_encryption_key` (placeholder, can equal the per-device key value)
-because the base parses that name at load time even though the
-wrapper's `api.encryption.key` override is what actually ships in
-the firmware. Other shared secrets the base references — `wifi_ssid`,
-`wifi_password`, `ota_password`, `server_url` — must also be there.
+Both produce identical firmware. For each per-device wrapper,
+`secrets.yaml` (the consuming environment's — local for flavor A,
+`/config/esphome/secrets.yaml` for flavor B) needs:
+
+```yaml
+wifi_ssid: "..."
+wifi_password: "..."
+ota_password: "..."
+server_url: "ws://homeassistant.local:10245"
+api_encryption_key_voicepe2: "<unique base64 32 bytes>"
+```
+
+Why the structure looks this way (history that's worth keeping):
+
+- ESPHome `packages:` deep-merges maps but **concatenates lists**.
+  If the wrapper declares `external_components`, it doesn't replace
+  the package's — both end up in the merged config. Splitting
+  `external_components` into its own file lets each wrapper pick
+  the right shard cleanly.
+- ESPHome doesn't expand substitutions inside `!secret` tags, so
+  `!secret api_encryption_key_${var}` doesn't work. The
+  `api.encryption.key` is intentionally NOT in the base so the
+  wrapper provides it directly, no placeholder secret needed.
+- Relative file references inside a packaged YAML resolve against
+  the **consuming** YAML's directory, not the package cache. That's
+  why flavor B has to override `wake_word_triggered_sound_file` to
+  a URL.
 
 For either flavor, add the per-device API key to `secrets.yaml`:
 

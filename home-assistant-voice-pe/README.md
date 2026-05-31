@@ -56,13 +56,19 @@ Or run `poetry run esphome ...` directly if you prefer.
 
 ## Multi-device setup
 
+The firmware is split into composable shards (`voice_pe_base.yaml`
++ `voice_pe_components_local.yaml` + `voice_pe_components_git.yaml`)
+so per-device wrappers can stay small. `voice_pe_config.yaml` itself
+is a wrapper for the default `ha-voice-openai` speaker.
+
 For a second speaker, create a tiny per-device wrapper next to
-`voice_pe_config.yaml` (template: `voice_pe_example.yaml`):
+`voice_pe_base.yaml` (template: `voice_pe_example.yaml`):
 
 ```yaml
 # voice_pe_voicepe2.yaml
 packages:
-  base: !include voice_pe_config.yaml
+  base: !include voice_pe_base.yaml
+  components: !include voice_pe_components_local.yaml
 
 substitutions:
   device_name: voicepe2
@@ -86,21 +92,16 @@ just flash device=voicepe2
 just logs device=voicepe2
 ```
 
-If instead you want to onboard the device via HA's ESPHome Device
-Builder addon (no local repo needed), use the **git package**
-flavor — `voice_pe_example.yaml` shows both. Pasted into the HA
-ESPHome dashboard with the per-device key added to
-`/config/esphome/secrets.yaml`, ESPHome fetches the base + custom
-component from this repo at compile time.
+### Onboarding via HA's ESPHome Device Builder (no local repo)
 
-The git-package wrapper must **also override `external_components`**
-to use git source for the `voice_assistant_websocket` component (the
-base ships `type: local` which only works when the repo is cloned
-alongside the YAML, which isn't true inside the HA addon). And the
-dashboard's secrets.yaml needs a placeholder `api_encryption_key`
-entry (the base parses it at load time, before the wrapper's
-override applies) in addition to the per-device key. See
-`voice_pe_example.yaml`'s flavor B for the full template.
+Use the **git-package** flavor in `voice_pe_example.yaml`. It points
+at `voice_pe_components_git.yaml` so the custom component is fetched
+from this repo, and overrides `wake_word_triggered_sound_file` to a
+github raw URL so the wake-word audio file resolves without needing
+the repo cloned. Drop the wrapper into the HA ESPHome dashboard, add
+`api_encryption_key_<device>` + shared secrets (`wifi_ssid`,
+`wifi_password`, `ota_password`, `server_url`) to
+`/config/esphome/secrets.yaml`, and Install.
 
 ## Configuration
 

@@ -1,74 +1,56 @@
 # Per-device wrapper TEMPLATE for adding additional Voice PE speakers.
 #
-# Two flavors below — pick the one that matches where you're going to
-# compile this YAML. They produce identical firmware:
+# Two flavors below — pick the one that matches where you'll compile
+# this YAML. They produce identical firmware:
 #
-#   A) Local !include — for compiling from a clone of this repo
-#      (your Mac with `just flash device=<name>` or `poetry run
-#      esphome run voice_pe_<name>.yaml`). Picks up uncommitted
-#      changes to voice_pe_config.yaml or the custom C++ component
-#      immediately, no push/pull needed.
+#   A) Local !include — compile from a clone of this repo (your Mac
+#      with `just flash device=<name>` or `poetry run esphome run
+#      voice_pe_<name>.yaml`). Picks up uncommitted changes to the
+#      base or the custom C++ component immediately, no push/pull
+#      needed. Wrapper lives next to voice_pe_base.yaml.
 #
-#   B) Git package — for pasting into HA's ESPHome Device Builder
-#      addon UI, or any other ESPHome instance that doesn't have
-#      this repo cloned. ESPHome fetches the base + custom component
-#      from github at compile time. Self-contained one-file paste.
-#      For dev iteration you'd need to push first.
+#   B) Git package — paste straight into HA's ESPHome Device Builder
+#      addon UI (or any other ESPHome instance that doesn't have
+#      this repo cloned). ESPHome fetches the base + custom
+#      component from github at compile time. Self-contained.
 #
 # Steps:
 #   1. Copy this file to voice_pe_<your-device-name>.yaml (same dir
-#      if local, or paste straight into HA's ESPHome dashboard).
+#      if flavor A, or paste straight into the HA dashboard).
 #   2. Replace `voice_pe_example` everywhere below with your device
 #      name (lowercase, no spaces).
-#   3. Pick ONE of the `packages:` blocks below — delete the other.
-#      If you pick flavor B, ALSO uncomment the external_components
-#      block below it.
+#   3. Delete the flavor you're NOT using.
 #   4. Add the per-device API key to secrets.yaml:
 #        api_encryption_key_<your-device-name>: "<base64 32 bytes>"
 #      (generate with: openssl rand -base64 32)
-#   5. For flavor B in the HA ESPHome addon, also make sure the
-#      following are in /config/esphome/secrets.yaml — the base
-#      references them at parse time:
-#        wifi_ssid, wifi_password, ota_password, server_url,
-#        api_encryption_key (placeholder; can be the same value as
-#        your per-device key — it's overridden by the wrapper).
-#   6. Flash with `just flash device=<your-device-name>` (local) or
-#      Install from the HA ESPHome dashboard (git).
+#      The HA dashboard's secrets.yaml is at /config/esphome/
+#      secrets.yaml. It also needs wifi_ssid, wifi_password,
+#      ota_password, and server_url.
+#   5. Flash:
+#        just flash device=<your-device-name>          # flavor A
+#      OR Install from the HA ESPHome dashboard.       # flavor B
 
-# --- Flavor A: local include (delete if using git) ---
+# --- Flavor A: local include (delete if using flavor B) ---
 packages:
-  base: !include voice_pe_config.yaml
+  base: !include voice_pe_base.yaml
+  components: !include voice_pe_components_local.yaml
 
-# --- Flavor B: git package (delete if using local include) ---
+# --- Flavor B: git package (delete if using flavor A) ---
 # packages:
 #   base:
 #     url: https://github.com/brettfire/ha-openai-realtime
 #     ref: main
-#     files: [home-assistant-voice-pe/voice_pe_config.yaml]
-#
-# # When using flavor B, also override external_components so the
-# # custom voice_assistant_websocket component is fetched from git
-# # (the base's `type: local` only works when the repo is cloned
-# # alongside the YAML — true for flavor A, NOT true for paste-into-
-# # HA-dashboard usage). Re-declares the voice_kit entry too because
-# # ESPHome packages REPLACE lists wholesale rather than merging.
-# external_components:
-#   - source:
-#       type: git
-#       url: https://github.com/brettfire/ha-openai-realtime
-#       ref: main
-#       path: home-assistant-voice-pe/esphome/components
-#     components: [voice_assistant_websocket]
-#     refresh: 0s
-#   - source:
-#       type: git
-#       url: https://github.com/esphome/home-assistant-voice-pe
-#       ref: 25.11.0
-#     components: [voice_kit]
-#     refresh: 0s
+#     files: [home-assistant-voice-pe/voice_pe_base.yaml]
+#   components:
+#     url: https://github.com/brettfire/ha-openai-realtime
+#     ref: main
+#     files: [home-assistant-voice-pe/voice_pe_components_git.yaml]
 
 substitutions:
   device_name: voice_pe_example
+  # For flavor B uncomment this so ESPHome fetches the wake-word
+  # sound file from github rather than expecting it on local disk:
+  # wake_word_triggered_sound_file: https://raw.githubusercontent.com/brettfire/ha-openai-realtime/main/home-assistant-voice-pe/wake_sound.flac
 
 api:
   encryption:
