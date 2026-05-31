@@ -83,7 +83,9 @@ side; only the satellite's audio-streaming behavior changes.
   connects while one is already active, the older connection is
   dropped (`"Only one client allowed, using new connection"`). For
   multi-satellite deployments each satellite should hit a separate
-  addon instance.
+  addon instance. **Future:** `plans/MULTI_SATELLITE.md` describes
+  the per-connection-pipeline refactor + wake-word arbiter that
+  would lift this limit.
 
 - **Wake word during bot speech in wake-word mode.** Designed to
   feel like an interrupt: the bot stops mid-sentence and listens
